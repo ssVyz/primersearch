@@ -12,6 +12,11 @@ wheels/
 venv/
 .idea/
 
+# folders old
+reference_program/
+example_sets/
+*.py
+
 # environment variables
 .env
 env/
