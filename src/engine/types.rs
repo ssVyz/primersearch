@@ -24,6 +24,10 @@ pub struct SearchSettings {
     pub only_twofold: bool,
     pub orientation: Orientation,
     pub three_prime_match: usize,
+    /// Per-range cap on the number of unique subsequences tried as
+    /// seeds in incremental mode. `0` disables the cap (try every unique
+    /// subsequence).
+    pub max_seeds: usize,
 }
 
 impl SearchSettings {

@@ -277,6 +277,7 @@ fn evaluate_range(
             settings.only_twofold,
             settings.three_prime_match,
             is_reverse,
+            settings.max_seeds,
         )?,
     };
 
@@ -326,9 +327,23 @@ fn eval_no_ambiguities(subsequences: &[&[u8]]) -> (Vec<u8>, usize, Vec<usize>) {
 }
 
 /// Incremental mode: try increasing ambiguity budgets; for each budget try
-/// up to 50 distinct subsequences as seeds. For each seed, greedily absorb
-/// other unique subsequences as long as the resulting consensus stays within
-/// the budget. Pick the best consensus across all seeds.
+/// up to `max_seeds` distinct subsequences as seeds (`0` = no cap). For
+/// each seed, build a candidate group with greedy expansion in *several*
+/// orderings and keep whichever produces the highest-coverage consensus.
+/// Pick the best consensus across all seeds.
+///
+/// The orderings tried per seed:
+///   1. First-appearance order (input order — matches the legacy Python
+///      tool's behaviour).
+///   2. Count descending, ties broken lexicographically (popular slices
+///      absorbed first).
+///   3. Count ascending, ties broken lexicographically (rare slices
+///      absorbed first — leaves budget for high-frequency slices later).
+///
+/// Different orderings produce *structurally different* consensuses
+/// (different IUPAC codes at different positions), not just tie-broken
+/// equivalents. Trying multiple orderings and keeping the best is a cheap
+/// way to approximate the per-range max-coverage objective more closely.
 fn eval_incremental(
     subsequences: &[&[u8]],
     target_pct: f64,
@@ -337,14 +352,13 @@ fn eval_incremental(
     only_twofold: bool,
     three_prime_len: usize,
     is_reverse: bool,
+    max_seeds: usize,
 ) -> Option<(Vec<u8>, usize, Vec<usize>, usize)> {
     if subsequences.is_empty() {
         return None;
     }
 
-    // Build `unique` in first-appearance order — required to match the
-    // Python iteration order (dict insertion order). The greedy expansion
-    // loop below depends on this order.
+    // Build `unique` in first-appearance order.
     let mut index_of: HashMap<&[u8], usize> = HashMap::new();
     let mut unique: Vec<(&[u8], Vec<usize>)> = Vec::new();
     for (i, s) in subsequences.iter().enumerate() {
@@ -355,16 +369,43 @@ fn eval_incremental(
             unique.push((*s, vec![i]));
         }
     }
+    let n_unique = unique.len();
 
     let total = subsequences.len();
     let target_count = (target_pct / 100.0 * total as f64).ceil() as usize;
 
-    // Seed iteration order: by count descending, ties broken by first-
-    // appearance order (Python's `sorted()` is stable, so `sorted(seqs,
-    // key=-count)` preserves insertion order on ties).
-    let mut seed_order: Vec<usize> = (0..unique.len()).collect();
+    // Seed iteration order: count desc, ties broken by first-appearance.
+    let mut seed_order: Vec<usize> = (0..n_unique).collect();
     seed_order.sort_by(|&a, &b| unique[b].1.len().cmp(&unique[a].1.len()));
-    let max_seeds = seed_order.len().min(50);
+    let seed_limit = if max_seeds == 0 {
+        n_unique
+    } else {
+        n_unique.min(max_seeds)
+    };
+
+    // Pre-compute the three expansion orderings — same for every seed.
+    let order_first_app: Vec<usize> = (0..n_unique).collect();
+    let mut order_count_desc: Vec<usize> = (0..n_unique).collect();
+    order_count_desc.sort_by(|&a, &b| {
+        unique[b]
+            .1
+            .len()
+            .cmp(&unique[a].1.len())
+            .then(unique[a].0.cmp(unique[b].0))
+    });
+    let mut order_count_asc: Vec<usize> = (0..n_unique).collect();
+    order_count_asc.sort_by(|&a, &b| {
+        unique[a]
+            .1
+            .len()
+            .cmp(&unique[b].1.len())
+            .then(unique[a].0.cmp(unique[b].0))
+    });
+    let orderings: [&[usize]; 3] = [
+        &order_first_app,
+        &order_count_desc,
+        &order_count_asc,
+    ];
 
     let mut best_consensus: Option<Vec<u8>> = None;
     let mut best_count: usize = 0;
@@ -376,47 +417,50 @@ fn eval_incremental(
         if found_target {
             break;
         }
-        for &seed_idx in seed_order.iter().take(max_seeds) {
-            let seed_seq = unique[seed_idx].0;
+        for &seed_idx in seed_order.iter().take(seed_limit) {
+            // Try each ordering for this seed; remember the highest-
+            // coverage valid consensus.
+            let mut seed_best: Option<(Vec<u8>, usize, usize, Vec<usize>)> = None;
 
-            let mut group: Vec<&[u8]> = Vec::with_capacity(unique.len());
-            group.push(seed_seq);
-            // Inner expansion: iterate `unique` in first-appearance order
-            // (NOT seed_order). Matches Python's
-            // `for other_seq in unique_seqs:` over insertion-ordered keys.
-            for (oi, (other_seq, _)) in unique.iter().enumerate() {
-                if oi == seed_idx {
+            for order in orderings.iter() {
+                let Some((consensus, amb_count)) = greedy_expand(
+                    seed_idx,
+                    &unique,
+                    order,
+                    amb_level,
+                    exclude_n,
+                    only_twofold,
+                ) else {
+                    continue;
+                };
+                if !check_three_prime_ok(&consensus, three_prime_len, is_reverse) {
                     continue;
                 }
-                group.push(*other_seq);
-                let ok = match create_consensus(&group, exclude_n, only_twofold) {
-                    Some((_, amb_count)) => amb_count <= amb_level,
-                    None => false,
+
+                let mut coverage_count: usize = 0;
+                let mut local_indices: Vec<usize> = Vec::new();
+                for (uniq_seq, indices) in unique.iter() {
+                    if sequence_matches_consensus(uniq_seq, &consensus) {
+                        coverage_count += indices.len();
+                        local_indices.extend_from_slice(indices);
+                    }
+                }
+
+                let take = match &seed_best {
+                    None => true,
+                    Some((_, sb_amb, sb_count, _)) => {
+                        coverage_count > *sb_count
+                            || (coverage_count == *sb_count && amb_count < *sb_amb)
+                    }
                 };
-                if !ok {
-                    group.pop();
+                if take {
+                    seed_best = Some((consensus, amb_count, coverage_count, local_indices));
                 }
             }
 
-            let (consensus, amb_count) = match create_consensus(&group, exclude_n, only_twofold) {
-                Some((c, a)) if a <= amb_level => (c, a),
-                _ => continue,
-            };
-
-            if !check_three_prime_ok(&consensus, three_prime_len, is_reverse) {
+            let Some((consensus, amb_count, coverage_count, local_indices)) = seed_best else {
                 continue;
-            }
-
-            // Total coverage = sum of bucket counts for every unique
-            // subseq that this consensus matches.
-            let mut coverage_count: usize = 0;
-            let mut local_indices: Vec<usize> = Vec::new();
-            for (uniq_seq, indices) in unique.iter() {
-                if sequence_matches_consensus(uniq_seq, &consensus) {
-                    coverage_count += indices.len();
-                    local_indices.extend_from_slice(indices);
-                }
-            }
+            };
 
             let is_better = if found_target {
                 coverage_count > best_count
@@ -449,6 +493,37 @@ fn eval_incremental(
 
     best_local.sort();
     Some((best_consensus.expect("checked above"), best_count, best_local, best_amb))
+}
+
+/// One greedy expansion pass: start from `seed_idx`, walk `unique` in the
+/// given order, and absorb each candidate slice if the resulting consensus
+/// stays within `amb_level` ambiguities and respects exclude_n /
+/// only_twofold. Returns `(consensus, amb_count)` if the final consensus is
+/// valid and within budget, `None` otherwise.
+fn greedy_expand(
+    seed_idx: usize,
+    unique: &[(&[u8], Vec<usize>)],
+    order: &[usize],
+    amb_level: usize,
+    exclude_n: bool,
+    only_twofold: bool,
+) -> Option<(Vec<u8>, usize)> {
+    let mut group: Vec<&[u8]> = Vec::with_capacity(unique.len());
+    group.push(unique[seed_idx].0);
+    for &oi in order {
+        if oi == seed_idx {
+            continue;
+        }
+        group.push(unique[oi].0);
+        let ok = match create_consensus(&group, exclude_n, only_twofold) {
+            Some((_, amb_count)) => amb_count <= amb_level,
+            None => false,
+        };
+        if !ok {
+            group.pop();
+        }
+    }
+    create_consensus(&group, exclude_n, only_twofold).filter(|(_, a)| *a <= amb_level)
 }
 
 /// Build an IUPAC consensus over a group of (filtered, A/C/G/T-only)

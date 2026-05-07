@@ -62,6 +62,11 @@ pub struct Args {
     #[arg(long, value_name = "N")]
     pub max_amb: Option<usize>,
 
+    /// Per-range cap on seeds tried in incremental mode (0 = no cap).
+    /// Higher = closer to optimal per-round coverage but slower.
+    #[arg(long, value_name = "N")]
+    pub max_seeds: Option<usize>,
+
     /// Forbid N (4-fold) consensus codes (incremental mode).
     #[arg(long)]
     pub exclude_n: bool,
@@ -127,6 +132,9 @@ pub fn resolve(args: &Args, cfg: &ConfigFile) -> ResolvedConfig {
     }
     if let Some(v) = args.max_amb {
         settings.max_ambiguities = v;
+    }
+    if let Some(v) = args.max_seeds {
+        settings.max_seeds = v;
     }
     if args.exclude_n {
         settings.exclude_n = true;

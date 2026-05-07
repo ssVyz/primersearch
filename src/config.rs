@@ -20,6 +20,13 @@ pub struct ConfigFile {
     pub orientation: ConfigOrientation,
     pub three_prime_match: usize,
     pub add_spacer: bool,
+    /// Per-range cap on seeds tried in incremental mode. 0 = no cap.
+    #[serde(default = "default_max_seeds")]
+    pub max_seeds: usize,
+}
+
+fn default_max_seeds() -> usize {
+    50
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -49,6 +56,7 @@ impl Default for ConfigFile {
             orientation: ConfigOrientation::Forward,
             three_prime_match: 0,
             add_spacer: true,
+            max_seeds: 50,
         }
     }
 }
@@ -83,6 +91,7 @@ impl ConfigFile {
             only_twofold: self.only_twofold,
             orientation: self.orientation.into(),
             three_prime_match: self.three_prime_match,
+            max_seeds: self.max_seeds,
         }
     }
 }
