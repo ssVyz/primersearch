@@ -1,0 +1,165 @@
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments and pycharm artefacts
+.venv/
+venv/
+.idea/
+
+# environment variables
+.env
+env/
+*.local
+*.secret
+*.secrets
+secrets/
+.envrc
+
+# Ignore jason!
+*.json
+
+# ----------------------------------------------------------------------
+# Logs / runtime files
+# ----------------------------------------------------------------------
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.pid
+*.pid.lock
+*.seed
+*.stackdump
+
+# ----------------------------------------------------------------------
+# Archives / packages
+# ----------------------------------------------------------------------
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.gz
+*.bz2
+*.xz
+
+# ----------------------------------------------------------------------
+# Generic build outputs
+# ----------------------------------------------------------------------
+build/
+dist/
+out/
+bin/
+obj/
+target/
+release/
+debug/
+tmp/
+temp/
+.cache/
+.cache-loader/
+.coverage
+coverage/
+htmlcov/
+reports/
+
+# ----------------------------------------------------------------------
+# C / C++ / CMake / Make
+# ----------------------------------------------------------------------
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.i
+*.ii
+*.s
+*.d
+
+# ----------------------------------------------------------------------
+# Go
+# ----------------------------------------------------------------------
+*.test
+*.prof
+vendor/
+coverage.out
+
+# ----------------------------------------------------------------------
+# Rust
+# ----------------------------------------------------------------------
+target/
+**/*.rs.bk
+
+# ----------------------------------------------------------------------
+# Databases / local data
+# ----------------------------------------------------------------------
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.dump
+*.sql.gz
+data/
+datasets/
+uploads/
+media/
+
+# ----------------------------------------------------------------------
+# Documentation/build artifacts
+# ----------------------------------------------------------------------
+site/
+_public/
+docs/_build/
+docs/.doctrees/
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+
+# md files
+*.md
+!README.md
+
+# TXT files
+*.txt
+
+# ----------------------------------------------------------------------
+# Node / JavaScript / TypeScript
+# ----------------------------------------------------------------------
+node_modules/
+jspm_packages/
+bower_components/
+
+# Build outputs
+.next/
+.nuxt/
+.svelte-kit/
+.angular/
+.vuepress/dist/
+.storybook-out/
+storybook-static/
+.parcel-cache/
+.turbo/
+.vercel/
+.netlify/
+.output/
+coverage/
+.nyc_output/
+
+# End of content
