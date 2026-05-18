@@ -21,9 +21,10 @@ Two search modes:
   user-set budget) to absorb closely-related variants into one primer.
   Falls back to exact-match if no ambiguity expansion qualifies.
 
-Constraints applied to each candidate primer: minimum Tm (salt-adjusted
-formula), maximum ambiguity count, optional 3' conserved tail, optional
-ban on N / non-2-fold codes, forward or reverse orientation.
+Constraints applied to each candidate primer: minimum Tm (nearest-neighbor
+thermodynamic calculation — see "Tm calculation" below), maximum ambiguity
+count, optional 3' conserved tail, optional ban on N / non-2-fold codes,
+forward or reverse orientation.
 
 ## Build
 
@@ -72,7 +73,10 @@ defaults file, or pass `--config <path>` to point at an alternative.
 | `-o, --output FILE` | Output file (default `output.txt`) |
 | `--rev` / `--fwd` | Search reverse / forward orientation |
 | `--tm C` | Minimum Tm in °C |
+| `--oligo UM` | Oligo (primer) concentration in µM |
 | `--na MM` | Na⁺ concentration in mM |
+| `--mg MM` | Mg²⁺ concentration in mM |
+| `--dntp MM` | dNTP concentration in mM (one Mg²⁺ sequestered per dNTP) |
 | `--mode {no-ambiguities,incremental}` | Search mode |
 | `--target PCT` | Coverage target % at which the ambiguity counter is allowed to increase (incremental) |
 | `--max-amb N` | Maximum ambiguity codes per primer (incremental) |
@@ -132,6 +136,27 @@ Output is byte-identical across thread counts: phase 1 produces ranges in
 a fixed order, `rayon::par_iter().collect()` preserves that order, and
 the phase 3 reduce uses a deterministic tie-break.
 
+## Tm calculation
+
+Tm is computed from a full nearest-neighbor thermodynamic model
+(`src/engine/tm.rs`), not a salt-adjusted GC fraction:
+
+- ΔH / ΔS parameters from SantaLucia (1998) unified table, with
+  end-dependent initiation (G/C vs. A/T) for both 5' and 3' ends.
+- Salt correction: `ΔS_salt = ΔS + 0.368·(N-1)·ln([Na⁺]_eq)` where
+  `[Na⁺]_eq = [Na⁺] + 120·√(Mg_free)` and `Mg_free = max(Mg − dNTP, 0)`
+  (one Mg²⁺ sequestered per dNTP — von Ahsen 2001 / Owczarzy 2008).
+- Strand-concentration term: `Tm = ΔH·1000 / (ΔS_salt + R·ln(C_T/4)) − 273.15`
+  with the user-supplied oligo concentration interpreted as a single
+  strand of a non-self-complementary duplex (`C_T = 2·oligo_conc`).
+- IUPAC ambiguity codes in a primer expand to all A/C/G/T variants;
+  the reported Tm is the median across variants.
+
+For the operating conditions used by this tool (oligo = 0.2 µM,
+Na⁺ = 50 mM, Mg²⁺ = 3 mM, dNTP = 0.8 mM), the predicted Tms agree with
+a commercial NN calculator (see `example_sets/example_oligo_tm.csv`) to
+within 2 °C across the reference panel.
+
 ## Repository layout
 
 ```
@@ -148,7 +173,8 @@ src/
     types.rs         SearchSettings / PrimerCandidate / etc., Progress trait
     iupac.rs         bitmask-based IUPAC code utilities
     fasta.rs         FASTA parser + quality filter
-    search.rs        greedy round loop, per-range evaluators, Tm calc
+    tm.rs            nearest-neighbor thermodynamic Tm
+    search.rs        greedy round loop, per-range evaluators
 example_sets/      reference inputs and Python-tool outputs for testing
 reference_program/ original Python implementation (kept for reference)
 program_instructions.md  initial spec / Q&A

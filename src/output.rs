@@ -82,7 +82,10 @@ pub fn format_results<W: Write>(
     )?;
     writeln!(w, "Primers Found:    {}", result.primers.len())?;
     writeln!(w, "Tm Threshold:     {:.1}°C", settings.tm_threshold)?;
+    writeln!(w, "Oligo Conc:       {:.3} µM", settings.oligo_concentration_um)?;
     writeln!(w, "Na+ Conc:         {:.1} mM", settings.na_concentration_mm)?;
+    writeln!(w, "Mg2+ Conc:        {:.2} mM", settings.mg_concentration_mm)?;
+    writeln!(w, "dNTP Conc:        {:.2} mM", settings.dntp_concentration_mm)?;
     if settings.three_prime_match > 0 {
         writeln!(w, "3' Perfect Match: {} bases", settings.three_prime_match)?;
     }

@@ -16,7 +16,10 @@ pub enum Orientation {
 #[derive(Debug, Clone)]
 pub struct SearchSettings {
     pub tm_threshold: f64,
+    pub oligo_concentration_um: f64,
     pub na_concentration_mm: f64,
+    pub mg_concentration_mm: f64,
+    pub dntp_concentration_mm: f64,
     pub mode: SearchMode,
     pub target_coverage_pct: f64,
     pub max_ambiguities: usize,
@@ -31,8 +34,13 @@ pub struct SearchSettings {
 }
 
 impl SearchSettings {
-    pub fn na_conc_molar(&self) -> f64 {
-        self.na_concentration_mm / 1000.0
+    pub fn tm_params(&self) -> crate::engine::tm::TmParams {
+        crate::engine::tm::TmParams {
+            oligo_conc_um: self.oligo_concentration_um,
+            na_conc_mm: self.na_concentration_mm,
+            mg_conc_mm: self.mg_concentration_mm,
+            dntp_conc_mm: self.dntp_concentration_mm,
+        }
     }
     pub fn is_reverse(&self) -> bool {
         matches!(self.orientation, Orientation::Reverse)

@@ -50,6 +50,18 @@ pub struct Args {
     #[arg(long, value_name = "MM")]
     pub na: Option<f64>,
 
+    /// Mg2+ concentration (mM).
+    #[arg(long, value_name = "MM")]
+    pub mg: Option<f64>,
+
+    /// dNTP concentration (mM). Each dNTP is assumed to sequester one Mg2+.
+    #[arg(long, value_name = "MM")]
+    pub dntp: Option<f64>,
+
+    /// Total oligo (primer) concentration (µM).
+    #[arg(long = "oligo", value_name = "UM")]
+    pub oligo_conc: Option<f64>,
+
     /// Search mode.
     #[arg(long, value_enum)]
     pub mode: Option<CliSearchMode>,
@@ -120,6 +132,15 @@ pub fn resolve(args: &Args, cfg: &ConfigFile) -> ResolvedConfig {
     }
     if let Some(v) = args.na {
         settings.na_concentration_mm = v;
+    }
+    if let Some(v) = args.mg {
+        settings.mg_concentration_mm = v;
+    }
+    if let Some(v) = args.dntp {
+        settings.dntp_concentration_mm = v;
+    }
+    if let Some(v) = args.oligo_conc {
+        settings.oligo_concentration_um = v;
     }
     if let Some(m) = args.mode {
         settings.mode = match m {

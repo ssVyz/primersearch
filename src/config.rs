@@ -11,7 +11,13 @@ use crate::engine::{Orientation, SearchMode, SearchSettings};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
     pub tm_threshold: f64,
+    #[serde(default = "default_oligo_concentration_um")]
+    pub oligo_concentration_um: f64,
     pub na_concentration_mm: f64,
+    #[serde(default = "default_mg_concentration_mm")]
+    pub mg_concentration_mm: f64,
+    #[serde(default = "default_dntp_concentration_mm")]
+    pub dntp_concentration_mm: f64,
     pub search_mode: ConfigSearchMode,
     pub target_coverage_pct: f64,
     pub max_ambiguities: usize,
@@ -27,6 +33,15 @@ pub struct ConfigFile {
 
 fn default_max_seeds() -> usize {
     50
+}
+fn default_oligo_concentration_um() -> f64 {
+    0.2
+}
+fn default_mg_concentration_mm() -> f64 {
+    3.0
+}
+fn default_dntp_concentration_mm() -> f64 {
+    0.8
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -47,7 +62,10 @@ impl Default for ConfigFile {
     fn default() -> Self {
         Self {
             tm_threshold: 55.0,
-            na_concentration_mm: 150.0,
+            oligo_concentration_um: 0.2,
+            na_concentration_mm: 50.0,
+            mg_concentration_mm: 3.0,
+            dntp_concentration_mm: 0.8,
             search_mode: ConfigSearchMode::NoAmbiguities,
             target_coverage_pct: 50.0,
             max_ambiguities: 1,
@@ -83,7 +101,10 @@ impl ConfigFile {
     pub fn to_settings(&self) -> SearchSettings {
         SearchSettings {
             tm_threshold: self.tm_threshold,
+            oligo_concentration_um: self.oligo_concentration_um,
             na_concentration_mm: self.na_concentration_mm,
+            mg_concentration_mm: self.mg_concentration_mm,
+            dntp_concentration_mm: self.dntp_concentration_mm,
             mode: self.search_mode.into(),
             target_coverage_pct: self.target_coverage_pct,
             max_ambiguities: self.max_ambiguities,

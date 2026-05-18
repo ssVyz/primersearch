@@ -19,70 +19,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rayon::prelude::*;
 
-use crate::engine::iupac::{base_mask, is_ambiguous, mask_to_iupac, reverse_complement, MASK_C, MASK_G};
+use crate::engine::iupac::{base_mask, is_ambiguous, mask_to_iupac, reverse_complement};
+use crate::engine::tm::{calculate_tm, determine_oligo_length, TmParams};
 use crate::engine::types::{
     Orientation, PrimerCandidate, PrimerSearchResult, Progress, SearchMode, SearchSettings,
 };
-
-// ---------------------------------------------------------------------------
-// Tm
-// ---------------------------------------------------------------------------
-
-/// Salt-adjusted Tm:  81.5 + 16.6·log10([Na+]) + 0.41·%GC − 675/n.
-///
-/// IUPAC ambiguity codes contribute their *fractional* GC content (e.g. an
-/// `R = {A, G}` position contributes 0.5 GC). For pure A/C/G/T inputs this
-/// is identical to the integer count.
-pub fn calculate_tm(sequence: &[u8], na_conc_molar: f64) -> f64 {
-    let n = sequence.len();
-    if n == 0 {
-        return 0.0;
-    }
-    let mut gc_score = 0.0_f64;
-    for &b in sequence {
-        let mask = base_mask(b);
-        let total = mask.count_ones();
-        if total == 0 {
-            continue;
-        }
-        let gc = (mask & (MASK_G | MASK_C)).count_ones();
-        gc_score += gc as f64 / total as f64;
-    }
-    let gc_pct = (gc_score / n as f64) * 100.0;
-    let na = na_conc_molar.max(1e-10);
-    81.5 + 16.6 * na.log10() + 0.41 * gc_pct - 675.0 / (n as f64)
-}
-
-/// Smallest oligo length starting at `start` whose Tm reaches the threshold,
-/// or `None` if extending to the end of `seq` does not. Computed
-/// incrementally — O(L) per call, not O(L²) like the naïve form.
-pub fn determine_oligo_length(
-    seq: &[u8],
-    start: usize,
-    tm_threshold: f64,
-    na_conc_molar: f64,
-) -> Option<usize> {
-    if start >= seq.len() {
-        return None;
-    }
-    let max_len = seq.len() - start;
-    let na = na_conc_molar.max(1e-10);
-    let na_log = na.log10();
-    let mut gc_count: usize = 0;
-    for length in 1..=max_len {
-        let added = seq[start + length - 1];
-        if added == b'G' || added == b'C' {
-            gc_count += 1;
-        }
-        let n = length as f64;
-        let gc_pct = (gc_count as f64 / n) * 100.0;
-        let tm = 81.5 + 16.6 * na_log + 0.41 * gc_pct - 675.0 / n;
-        if tm >= tm_threshold {
-            return Some(length);
-        }
-    }
-    None
-}
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -102,7 +43,7 @@ pub fn find_primers(
         result.message = "No sequences to analyze".to_string();
         return result;
     }
-    let na_molar = settings.na_conc_molar();
+    let tm_params = settings.tm_params();
     let is_reverse = matches!(settings.orientation, Orientation::Reverse);
     let seq_len = sequences[0].len();
 
@@ -138,7 +79,7 @@ pub fn find_primers(
         for seq in remaining_seqs.iter() {
             for start in 0..seq_len {
                 if let Some(len) =
-                    determine_oligo_length(seq, start, settings.tm_threshold, na_molar)
+                    determine_oligo_length(seq, start, settings.tm_threshold, &tm_params)
                 {
                     let end = start + len;
                     if end > seq_len {
@@ -168,7 +109,7 @@ pub fn find_primers(
                 if progress.cancelled() {
                     return None;
                 }
-                evaluate_range(start, end, &remaining_seqs, settings, na_molar, is_reverse)
+                evaluate_range(start, end, &remaining_seqs, settings, &tm_params, is_reverse)
             })
             .collect();
 
@@ -256,7 +197,7 @@ fn evaluate_range(
     end: usize,
     remaining_seqs: &[&[u8]],
     settings: &SearchSettings,
-    na_molar: f64,
+    tm_params: &TmParams,
     is_reverse: bool,
 ) -> Option<EvalResult> {
     let subsequences: Vec<&[u8]> = remaining_seqs.iter().map(|s| &s[start..end]).collect();
@@ -282,7 +223,7 @@ fn evaluate_range(
     };
 
     // Tm of the actual displayed primer (the consensus / chosen variant).
-    let tm = calculate_tm(&variant, na_molar);
+    let tm = calculate_tm(&variant, tm_params);
 
     Some(EvalResult {
         start,

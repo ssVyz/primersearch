@@ -12,11 +12,13 @@
 mod fasta;
 mod iupac;
 mod search;
+pub mod tm;
 mod types;
 
 pub use fasta::{parse_fasta, quality_filter};
 pub use iupac::{is_ambiguous, reverse_complement};
-pub use search::{calculate_tm, determine_oligo_length, find_primers};
+pub use search::find_primers;
+pub use tm::{calculate_tm, determine_oligo_length, TmParams};
 pub use types::{
     NoProgress, Orientation, PrimerCandidate, PrimerSearchResult, Progress, QualityReport,
     SearchMode, SearchSettings,
