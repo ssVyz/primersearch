@@ -6,7 +6,11 @@
 //!     subsequence reaches the Tm threshold. Collect the unique
 //!     `(start, end)` alignment ranges seen.
 //!  2. (parallel) Evaluate every unique range against every remaining
-//!     sequence.
+//!     sequence. Only variants whose own Tm meets the threshold may be
+//!     chosen; in incremental mode this constraint applies to the *seed*
+//!     (an exact A/C/G/T slice from one of the input rows) — the
+//!     resulting consensus may have a lower median Tm once ambiguity
+//!     codes resolve to A/T-rich expansions, which is accepted.
 //!  3. (single-threaded) Pick the best candidate with a stable tie-break,
 //!     remove its covered sequences from the pool, repeat.
 //!
@@ -204,10 +208,8 @@ fn evaluate_range(
 
     let (variant, count, local_indices, amb_count) = match settings.mode {
         SearchMode::NoAmbiguities => {
-            let (v, c, l) = eval_no_ambiguities(&subsequences);
-            if c == 0 {
-                return None;
-            }
+            let (v, c, l) =
+                eval_no_ambiguities(&subsequences, settings.tm_threshold, tm_params)?;
             (v, c, l, 0)
         }
         SearchMode::Incremental => eval_incremental(
@@ -219,6 +221,8 @@ fn evaluate_range(
             settings.three_prime_match,
             is_reverse,
             settings.max_seeds,
+            settings.tm_threshold,
+            tm_params,
         )?,
     };
 
@@ -236,13 +240,16 @@ fn evaluate_range(
     })
 }
 
-/// No-ambiguity mode: the most frequent exact subsequence wins. Ties broken
-/// by *first-appearance order* in `subsequences` — matches the reference
-/// Python implementation, which iterates a dict in insertion order with a
-/// `>` (strict-greater) update.
-fn eval_no_ambiguities(subsequences: &[&[u8]]) -> (Vec<u8>, usize, Vec<usize>) {
-    // First-appearance order: build a Vec in insertion order with a HashMap
-    // for fast lookup of which entry to extend.
+/// No-ambiguity mode: the most frequent exact subsequence *whose own Tm
+/// meets `tm_threshold`* wins. Ties broken by *first-appearance order* in
+/// `subsequences` — matches the reference Python implementation, which
+/// iterates a dict in insertion order with a `>` (strict-greater) update.
+/// Returns `None` if no variant at this range meets the threshold.
+fn eval_no_ambiguities(
+    subsequences: &[&[u8]],
+    tm_threshold: f64,
+    tm_params: &TmParams,
+) -> Option<(Vec<u8>, usize, Vec<usize>)> {
     let mut index_of: HashMap<&[u8], usize> = HashMap::new();
     let mut entries: Vec<(&[u8], Vec<usize>)> = Vec::new();
     for (i, s) in subsequences.iter().enumerate() {
@@ -253,18 +260,23 @@ fn eval_no_ambiguities(subsequences: &[&[u8]]) -> (Vec<u8>, usize, Vec<usize>) {
             entries.push((*s, vec![i]));
         }
     }
-    // Strict `>` update — first to reach a given count wins.
     let mut best_seq: &[u8] = b"";
     let mut best: Vec<usize> = Vec::new();
     let mut best_count: usize = 0;
     for (seq, idx) in entries.into_iter() {
+        if calculate_tm(seq, tm_params) < tm_threshold {
+            continue;
+        }
         if idx.len() > best_count {
             best_count = idx.len();
             best_seq = seq;
             best = idx;
         }
     }
-    (best_seq.to_vec(), best_count, best)
+    if best_count == 0 {
+        return None;
+    }
+    Some((best_seq.to_vec(), best_count, best))
 }
 
 /// Incremental mode: try increasing ambiguity budgets; for each budget try
@@ -294,6 +306,8 @@ fn eval_incremental(
     three_prime_len: usize,
     is_reverse: bool,
     max_seeds: usize,
+    tm_threshold: f64,
+    tm_params: &TmParams,
 ) -> Option<(Vec<u8>, usize, Vec<usize>, usize)> {
     if subsequences.is_empty() {
         return None;
@@ -312,16 +326,30 @@ fn eval_incremental(
     }
     let n_unique = unique.len();
 
+    // Per-unique-variant Tm. A seed is a real A/C/G/T slice from one of
+    // the input rows, so its own Tm must meet the user's threshold.
+    // Consensuses grown from a passing seed are accepted even if
+    // ambiguity expansion drops the median Tm below the threshold.
+    let unique_tm: Vec<f64> = unique
+        .iter()
+        .map(|(seq, _)| calculate_tm(seq, tm_params))
+        .collect();
+
     let total = subsequences.len();
     let target_count = (target_pct / 100.0 * total as f64).ceil() as usize;
 
     // Seed iteration order: count desc, ties broken by first-appearance.
-    let mut seed_order: Vec<usize> = (0..n_unique).collect();
+    // Variants below the Tm threshold are filtered out before sorting so
+    // they can never be chosen as a seed. `sort_by` is stable, so within
+    // a count bucket first-appearance order is preserved.
+    let mut seed_order: Vec<usize> = (0..n_unique)
+        .filter(|&i| unique_tm[i] >= tm_threshold)
+        .collect();
     seed_order.sort_by(|&a, &b| unique[b].1.len().cmp(&unique[a].1.len()));
     let seed_limit = if max_seeds == 0 {
-        n_unique
+        seed_order.len()
     } else {
-        n_unique.min(max_seeds)
+        seed_order.len().min(max_seeds)
     };
 
     // Pre-compute the three expansion orderings — same for every seed.
@@ -426,10 +454,15 @@ fn eval_incremental(
     }
 
     if best_consensus.is_none() || best_count == 0 {
-        // Fallback: most frequent exact subsequence.
-        let (seq, indices) = unique.into_iter().next()?;
+        // Fallback: most-frequent threshold-passing exact subsequence.
+        // `seed_order` is already filtered by Tm and sorted by count desc,
+        // so its first element (if any) is the right pick. If no seed
+        // passes, this range cannot yield a valid primer.
+        let &i = seed_order.first()?;
+        let seq = unique[i].0.to_vec();
+        let indices = unique[i].1.clone();
         let count = indices.len();
-        return Some((seq.to_vec(), count, indices, 0));
+        return Some((seq, count, indices, 0));
     }
 
     best_local.sort();
@@ -527,4 +560,77 @@ fn check_three_prime_ok(consensus: &[u8], three_prime_len: usize, is_reverse: bo
         &consensus[consensus.len() - n..]
     };
     !region.iter().any(|&c| is_ambiguous(c))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params() -> TmParams {
+        TmParams {
+            oligo_conc_um: 0.2,
+            na_conc_mm: 50.0,
+            mg_conc_mm: 3.0,
+            dntp_conc_mm: 0.8,
+        }
+    }
+
+    /// The most-frequent variant at a range is AT-rich (sub-threshold); a
+    /// minority variant is GC-rich and passes. The Tm filter must reject
+    /// the popular-but-cold variant and pick the rare-but-hot one.
+    #[test]
+    fn no_ambiguities_skips_low_tm_variant() {
+        let p = params();
+        let low: &[u8] = b"AAATAAATAAATAAAT";
+        let high: &[u8] = b"GCGCGCGCGCGCGCGC";
+        assert!(calculate_tm(low, &p) < 60.0, "test setup: low Tm");
+        assert!(calculate_tm(high, &p) >= 60.0, "test setup: high Tm");
+
+        let subs: Vec<&[u8]> = vec![low, low, low, low, low, high, high];
+        let (picked, count, _) =
+            eval_no_ambiguities(&subs, 60.0, &p).expect("at least one variant passes");
+        assert_eq!(picked, high.to_vec());
+        assert_eq!(count, 2);
+    }
+
+    /// When no variant at the range meets threshold, the range yields no
+    /// candidate — `evaluate_range` must propagate `None`.
+    #[test]
+    fn no_ambiguities_returns_none_when_all_below_threshold() {
+        let p = params();
+        let low: &[u8] = b"AAATAAATAAATAAAT";
+        let subs: Vec<&[u8]> = vec![low, low, low];
+        assert!(eval_no_ambiguities(&subs, 80.0, &p).is_none());
+    }
+
+    /// In incremental mode, a sub-threshold high-count seed must be
+    /// skipped, leaving a passing minority seed to drive the consensus.
+    /// With `max_ambiguities = 1` the two slices cannot be merged into one
+    /// consensus, so the result is the high-Tm slice alone.
+    #[test]
+    fn incremental_skips_low_tm_seed() {
+        let p = params();
+        let low: &[u8] = b"AAATAAATAAATAAAT";
+        let high: &[u8] = b"GCGCGCGCGCGCGCGC";
+        let subs: Vec<&[u8]> = vec![low, low, low, low, low, high, high];
+        let (consensus, count, _local, _amb) = eval_incremental(
+            &subs, 100.0, 1, false, false, 0, false, 0, 60.0, &p,
+        )
+        .expect("high-Tm seed exists");
+        assert_eq!(consensus, high.to_vec());
+        assert_eq!(count, 2);
+    }
+
+    /// Incremental fallback: if no seed passes threshold at all, return
+    /// `None` so the range is skipped rather than emitting a sub-threshold
+    /// primer.
+    #[test]
+    fn incremental_returns_none_when_no_seed_passes() {
+        let p = params();
+        let low: &[u8] = b"AAATAAATAAATAAAT";
+        let subs: Vec<&[u8]> = vec![low, low, low];
+        assert!(
+            eval_incremental(&subs, 100.0, 1, false, false, 0, false, 0, 80.0, &p).is_none()
+        );
+    }
 }
