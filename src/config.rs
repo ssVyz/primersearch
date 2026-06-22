@@ -113,6 +113,9 @@ impl ConfigFile {
             orientation: self.orientation.into(),
             three_prime_match: self.three_prime_match,
             max_seeds: self.max_seeds,
+            // Fixed mode is a per-invocation analysis choice, not a persisted
+            // default; it is only ever turned on by the `--fixed` CLI flag.
+            fixed: false,
         }
     }
 }

@@ -144,21 +144,7 @@ pub fn find_primers(
             .map(|&j| remaining_list[j])
             .collect();
 
-        let display_seq = if is_reverse {
-            reverse_complement(&best.sequence)
-        } else {
-            best.sequence.clone()
-        };
-        let coverage_pct = (best.count as f64 / total as f64) * 100.0;
-        let primer = PrimerCandidate {
-            sequence: display_seq,
-            coverage_count: best.count,
-            coverage_pct,
-            tm: best.tm,
-            align_start: best.start,
-            align_end: best.end,
-            ambiguity_count: best.amb_count,
-        };
+        let primer = make_primer(&best, total, is_reverse);
 
         for idx in &global_covered {
             remaining.remove(idx);
@@ -170,7 +156,7 @@ pub fn find_primers(
                 "Round {} done: primer covers {} sequences ({:.1}%). Total: {}/{} ({:.1}%)",
                 round,
                 best.count,
-                coverage_pct,
+                best.count as f64 / total as f64 * 100.0,
                 covered_so_far,
                 total,
                 covered_so_far as f64 / total as f64 * 100.0
@@ -180,6 +166,141 @@ pub fn find_primers(
     }
 
     result
+}
+
+/// Fixed-slice analysis — the search is skipped entirely.
+///
+/// The whole input alignment is treated as a single, user-chosen slice
+/// `[0, seq_len)`: the caller has already trimmed the FASTA down to exactly
+/// the region they want the primer at. The engine simply generates the
+/// oligo variant(s) required to cover *every* input sequence at that slice,
+/// using the same greedy round loop as [`find_primers`] but with the single
+/// fixed range instead of the dynamically-discovered ranges. Each round
+/// emits the highest-coverage variant over the still-uncovered sequences and
+/// removes those; the loop runs until coverage is 100%.
+///
+/// Variant generation obeys the configured [`SearchMode`] (exact vs. IUPAC
+/// consensus) plus the IUPAC / 3'-conservation / orientation settings.
+/// **The Tm threshold is not enforced**: the user picked the region, so
+/// every variant needed for full coverage is emitted regardless of its Tm.
+/// The per-variant Tm is still computed (from the configured concentrations)
+/// and reported on each primer, so a cold slice is reported, not silently
+/// dropped.
+pub fn find_primers_fixed(
+    sequences: &[Vec<u8>],
+    settings: &SearchSettings,
+    progress: &dyn Progress,
+) -> PrimerSearchResult {
+    let total = sequences.len();
+    let mut result = PrimerSearchResult {
+        total_sequences: total,
+        ..Default::default()
+    };
+    if total == 0 {
+        result.message = "No sequences to analyze".to_string();
+        return result;
+    }
+    let tm_params = settings.tm_params();
+    let is_reverse = matches!(settings.orientation, Orientation::Reverse);
+    let seq_len = sequences[0].len();
+    let (start, end) = (0usize, seq_len);
+
+    // The slice spans the whole alignment. Neutralise Tm gating inside the
+    // variant evaluators (a fixed slice must yield whatever covers the input,
+    // hot or cold). The real Tm is still computed via `tm_params`, which is
+    // independent of `tm_threshold`.
+    let mut eval_settings = settings.clone();
+    eval_settings.tm_threshold = f64::NEG_INFINITY;
+
+    let mut remaining: BTreeSet<usize> = (0..total).collect();
+    let mut round = 0;
+
+    while !remaining.is_empty() {
+        if progress.cancelled() {
+            result.message = "Search cancelled".to_string();
+            break;
+        }
+        round += 1;
+        let remaining_list: Vec<usize> = remaining.iter().copied().collect();
+        let remaining_seqs: Vec<&[u8]> = remaining_list
+            .iter()
+            .map(|&i| sequences[i].as_slice())
+            .collect();
+
+        progress.report(
+            &format!(
+                "Fixed slice: generating variant {} ({} sequences uncovered)",
+                round,
+                remaining_list.len()
+            ),
+            0.0,
+        );
+
+        // One range, evaluated directly — no phase-1 discovery, no rayon.
+        let Some(best) = evaluate_range(
+            start,
+            end,
+            &remaining_seqs,
+            &eval_settings,
+            &tm_params,
+            is_reverse,
+        ) else {
+            // Unreachable for non-degenerate input (with Tm gating off the
+            // evaluators always yield at least the most-frequent exact
+            // slice), but guard rather than loop forever.
+            result.message = "Could not generate a variant for the fixed slice".to_string();
+            break;
+        };
+
+        let global_covered: BTreeSet<usize> = best
+            .local_indices
+            .iter()
+            .map(|&j| remaining_list[j])
+            .collect();
+
+        let primer = make_primer(&best, total, is_reverse);
+        for idx in &global_covered {
+            remaining.remove(idx);
+        }
+        result.primers.push(primer);
+
+        let covered_so_far = total - remaining.len();
+        progress.report(
+            &format!(
+                "Fixed slice: variant {} covers {} sequences ({:.1}%). Total: {}/{} ({:.1}%)",
+                round,
+                best.count,
+                best.count as f64 / total as f64 * 100.0,
+                covered_so_far,
+                total,
+                covered_so_far as f64 / total as f64 * 100.0
+            ),
+            100.0,
+        );
+    }
+
+    result
+}
+
+/// Build the displayed [`PrimerCandidate`] from a per-range evaluation
+/// result: reverse-complement the sequence when the orientation is reverse
+/// and fill in the coverage percentage. Shared by the search and fixed-slice
+/// loops.
+fn make_primer(best: &EvalResult, total: usize, is_reverse: bool) -> PrimerCandidate {
+    let display_seq = if is_reverse {
+        reverse_complement(&best.sequence)
+    } else {
+        best.sequence.clone()
+    };
+    PrimerCandidate {
+        sequence: display_seq,
+        coverage_count: best.count,
+        coverage_pct: (best.count as f64 / total as f64) * 100.0,
+        tm: best.tm,
+        align_start: best.start,
+        align_end: best.end,
+        ambiguity_count: best.amb_count,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +686,7 @@ fn check_three_prime_ok(consensus: &[u8], three_prime_len: usize, is_reverse: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::types::NoProgress;
 
     fn params() -> TmParams {
         TmParams {
@@ -572,6 +694,28 @@ mod tests {
             na_conc_mm: 50.0,
             mg_conc_mm: 3.0,
             dntp_conc_mm: 0.8,
+        }
+    }
+
+    /// A `SearchSettings` for fixed-slice tests. Concentrations match the
+    /// reference operating conditions; `target_coverage_pct = 100` so
+    /// incremental mode absorbs as much as the ambiguity budget allows.
+    fn fixed_settings(mode: SearchMode) -> SearchSettings {
+        SearchSettings {
+            tm_threshold: 60.0,
+            oligo_concentration_um: 0.2,
+            na_concentration_mm: 50.0,
+            mg_concentration_mm: 3.0,
+            dntp_concentration_mm: 0.8,
+            mode,
+            target_coverage_pct: 100.0,
+            max_ambiguities: 2,
+            exclude_n: false,
+            only_twofold: false,
+            orientation: Orientation::Forward,
+            three_prime_match: 0,
+            max_seeds: 0,
+            fixed: true,
         }
     }
 
@@ -632,5 +776,83 @@ mod tests {
         assert!(
             eval_incremental(&subs, 100.0, 1, false, false, 0, false, 0, 80.0, &p).is_none()
         );
+    }
+
+    /// Fixed no-ambiguities: every distinct exact slice becomes its own
+    /// variant, ordered by coverage descending, and together they cover the
+    /// whole input. The reported range is always the full slice.
+    #[test]
+    fn fixed_no_ambiguities_emits_all_distinct_variants() {
+        let settings = fixed_settings(SearchMode::NoAmbiguities);
+        let a = b"GCGCGCGCGCGCGCGC".to_vec(); // count 3
+        let b = b"ATATATATATATATAT".to_vec(); // count 2
+        let c = b"TTTTGGGGCCCCAAAA".to_vec(); // count 1
+        let seqs = vec![a.clone(), a.clone(), a.clone(), b.clone(), b.clone(), c.clone()];
+
+        let res = find_primers_fixed(&seqs, &settings, &NoProgress);
+
+        assert_eq!(res.primers.len(), 3, "one variant per distinct slice");
+        assert_eq!(res.primers[0].coverage_count, 3);
+        assert_eq!(res.primers[1].coverage_count, 2);
+        assert_eq!(res.primers[2].coverage_count, 1);
+        for p in &res.primers {
+            assert_eq!((p.align_start, p.align_end), (0, 16), "full fixed slice");
+        }
+        let covered: usize = res.primers.iter().map(|p| p.coverage_count).sum();
+        assert_eq!(covered, seqs.len(), "100% coverage");
+    }
+
+    /// Fixed mode ignores the Tm threshold: a slice whose Tm is far below an
+    /// (unreachable) threshold is still emitted. The equivalent search would
+    /// find nothing here.
+    #[test]
+    fn fixed_ignores_tm_threshold() {
+        let mut settings = fixed_settings(SearchMode::NoAmbiguities);
+        settings.tm_threshold = 90.0; // unreachable for this AT-rich slice
+        let low = b"AAATAAATAAATAAAT".to_vec();
+        let seqs = vec![low.clone(), low.clone(), low.clone()];
+
+        let res = find_primers_fixed(&seqs, &settings, &NoProgress);
+
+        assert_eq!(res.primers.len(), 1);
+        assert_eq!(res.primers[0].coverage_count, 3);
+        // The cold Tm is still reported, not hidden.
+        assert!(res.primers[0].tm < 90.0);
+    }
+
+    /// Fixed incremental: slices differing at a single position are merged
+    /// into one IUPAC consensus when the ambiguity budget allows, covering
+    /// all input with a single variant.
+    #[test]
+    fn fixed_incremental_merges_into_consensus() {
+        let mut settings = fixed_settings(SearchMode::Incremental);
+        settings.max_ambiguities = 1;
+        let a = b"ACGTACGTACGTACGA".to_vec();
+        let b = b"ACGTACGTACGTACGG".to_vec(); // differs only at the last base
+        let seqs = vec![a.clone(), a.clone(), b.clone()];
+
+        let res = find_primers_fixed(&seqs, &settings, &NoProgress);
+
+        assert_eq!(res.primers.len(), 1, "merged into a single consensus");
+        assert_eq!(res.primers[0].coverage_count, 3);
+        assert_eq!(res.primers[0].ambiguity_count, 1);
+        assert_eq!(res.primers[0].sequence, b"ACGTACGTACGTACGR".to_vec());
+    }
+
+    /// Fixed reverse orientation: the displayed sequence is the reverse
+    /// complement of the alignment slice, while the reported range stays in
+    /// forward alignment coordinates.
+    #[test]
+    fn fixed_reverse_orientation_reverse_complements() {
+        let mut settings = fixed_settings(SearchMode::NoAmbiguities);
+        settings.orientation = Orientation::Reverse;
+        let s = b"AAAACCCCGGGGTTTT".to_vec();
+        let seqs = vec![s.clone(), s.clone()];
+
+        let res = find_primers_fixed(&seqs, &settings, &NoProgress);
+
+        assert_eq!(res.primers.len(), 1);
+        assert_eq!(res.primers[0].sequence, reverse_complement(&s));
+        assert_eq!((res.primers[0].align_start, res.primers[0].align_end), (0, 16));
     }
 }

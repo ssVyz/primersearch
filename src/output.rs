@@ -73,6 +73,9 @@ pub fn format_results<W: Write>(
         Orientation::Forward => "Forward (sense)",
         Orientation::Reverse => "Reverse (anti-sense)",
     };
+    if settings.fixed {
+        writeln!(w, "Analysis:         Fixed slice (search skipped)")?;
+    }
     writeln!(w, "Search Mode:      {mode_label}")?;
     writeln!(w, "Orientation:      {orient_label}")?;
     writeln!(
@@ -81,7 +84,15 @@ pub fn format_results<W: Write>(
         thousands(result.total_sequences)
     )?;
     writeln!(w, "Primers Found:    {}", result.primers.len())?;
-    writeln!(w, "Tm Threshold:     {:.1}°C", settings.tm_threshold)?;
+    if settings.fixed {
+        writeln!(
+            w,
+            "Tm Threshold:     {:.1}°C (not enforced; see per-primer Tm)",
+            settings.tm_threshold
+        )?;
+    } else {
+        writeln!(w, "Tm Threshold:     {:.1}°C", settings.tm_threshold)?;
+    }
     writeln!(w, "Oligo Conc:       {:.3} µM", settings.oligo_concentration_um)?;
     writeln!(w, "Na+ Conc:         {:.1} mM", settings.na_concentration_mm)?;
     writeln!(w, "Mg2+ Conc:        {:.2} mM", settings.mg_concentration_mm)?;

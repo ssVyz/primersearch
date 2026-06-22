@@ -10,7 +10,7 @@ use std::io::{BufWriter, Write};
 use clap::Parser;
 
 use crate::cli::Args;
-use crate::engine::{find_primers, parse_fasta, quality_filter};
+use crate::engine::{find_primers, find_primers_fixed, parse_fasta, quality_filter};
 use crate::progress::CliProgress;
 
 fn main() {
@@ -86,7 +86,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let progress = CliProgress::new(args.silent);
-    let result = find_primers(&report.valid_sequences, &settings, &progress);
+    let result = if settings.fixed {
+        find_primers_fixed(&report.valid_sequences, &settings, &progress)
+    } else {
+        find_primers(&report.valid_sequences, &settings, &progress)
+    };
     progress.finish();
 
     let out_file = fs::File::create(&args.output)

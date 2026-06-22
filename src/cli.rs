@@ -66,6 +66,15 @@ pub struct Args {
     #[arg(long, value_enum)]
     pub mode: Option<CliSearchMode>,
 
+    /// Fixed-slice mode: skip the search and treat the entire input alignment
+    /// as one user-chosen slice, generating only the variant(s) needed to
+    /// cover every input sequence at that slice. Combine with --mode to pick
+    /// exact (no-ambiguities) or IUPAC (incremental) variant generation. The
+    /// Tm threshold is not enforced in this mode; each variant's Tm is still
+    /// reported.
+    #[arg(long)]
+    pub fixed: bool,
+
     /// Target coverage per variant, % (incremental mode).
     #[arg(long, value_name = "PCT")]
     pub target: Option<f64>,
@@ -148,6 +157,7 @@ pub fn resolve(args: &Args, cfg: &ConfigFile) -> ResolvedConfig {
             CliSearchMode::Incremental => SearchMode::Incremental,
         };
     }
+    settings.fixed = args.fixed;
     if let Some(v) = args.target {
         settings.target_coverage_pct = v;
     }

@@ -31,6 +31,13 @@ pub struct SearchSettings {
     /// seeds in incremental mode. `0` disables the cap (try every unique
     /// subsequence).
     pub max_seeds: usize,
+    /// Fixed-slice mode. When `true`, the search is skipped: the entire
+    /// input alignment is treated as a single user-chosen slice and the
+    /// engine only generates the variant(s) needed to cover every input
+    /// sequence at that slice. The configured `mode` still selects how
+    /// variants are formed (exact vs. IUPAC consensus), but `tm_threshold`
+    /// is not used as a gate — see [`crate::engine::find_primers_fixed`].
+    pub fixed: bool,
 }
 
 impl SearchSettings {

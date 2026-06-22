@@ -21,6 +21,9 @@ Two search modes:
   user-set budget) to absorb closely-related variants into one primer.
   Falls back to exact-match if no ambiguity expansion qualifies.
 
+There is also a **fixed-slice** mode (`--fixed`) for when you already know
+*where* the primer should sit. See "Fixed-slice mode" below.
+
 Constraints applied to each candidate primer: minimum Tm (nearest-neighbor
 thermodynamic calculation — see "Tm calculation" below), maximum ambiguity
 count, optional 3' conserved tail, optional ban on N / non-2-fold codes,
@@ -54,10 +57,37 @@ Common invocations:
 primersearch input.fasta -o results.txt
 primersearch input.fasta -o results.txt --rev
 primersearch input.fasta --tm 62 --na 200 --mode incremental --target 60 --max-amb 3 --exclude-n --three-prime 5
+primersearch slice.fasta --fixed --mode incremental --max-amb 3   # generate variants for a fixed slice
 primersearch --mkini                 # write defaults to settings.ini
 primersearch input.fasta -j 8        # 8 worker threads
 primersearch input.fasta --silent    # no progress / info output
 ```
+
+### Fixed-slice mode
+
+`--fixed` skips the search entirely. Instead of hunting for the alignment
+positions that let one primer cover the most sequences, you hand the tool a
+FASTA that has already been trimmed to exactly the region you want the
+primer at — the whole alignment is treated as a single slice — and it just
+generates the oligo variant(s) needed to cover every input sequence there.
+
+It still runs the same per-round greedy coverage loop, but over that one
+fixed slice: each round emits the highest-coverage variant over the
+sequences not yet covered and removes them, repeating until coverage is
+100%. The configured `--mode` chooses how variants are formed:
+
+- `--fixed --mode no-ambiguities` — one exact primer per distinct sequence
+  in the slice, ordered by coverage.
+- `--fixed --mode incremental` — IUPAC consensus primers that absorb
+  related variants up to `--max-amb` (and respect `--exclude-n`,
+  `--only-twofold`, `--three-prime`, `--target`).
+
+Orientation (`--rev`/`--fwd`) applies as usual. The Tm threshold (`--tm`)
+is **not** enforced in fixed mode — you chose the region, so every variant
+required for full coverage is emitted regardless of its Tm; each variant's
+Tm is still computed and reported so you can judge the choice. The input is
+still quality-filtered (same length, A/C/G/T only), and every primer's
+reported position spans the full slice.
 
 ### Settings precedence
 
@@ -77,7 +107,8 @@ defaults file, or pass `--config <path>` to point at an alternative.
 | `--na MM` | Na⁺ concentration in mM |
 | `--mg MM` | Mg²⁺ concentration in mM |
 | `--dntp MM` | dNTP concentration in mM (one Mg²⁺ sequestered per dNTP) |
-| `--mode {no-ambiguities,incremental}` | Search mode |
+| `--mode {no-ambiguities,incremental}` | Variant-generation mode |
+| `--fixed` | Skip the search; treat the whole input as one slice and generate the variants needed to cover it (Tm threshold not enforced) |
 | `--target PCT` | Coverage target % at which the ambiguity counter is allowed to increase (incremental) |
 | `--max-amb N` | Maximum ambiguity codes per primer (incremental) |
 | `--exclude-n` / `--only-twofold` | IUPAC restrictions (incremental) |
@@ -135,6 +166,11 @@ Per-range evaluation depends on mode:
 Output is byte-identical across thread counts: phase 1 produces ranges in
 a fixed order, `rayon::par_iter().collect()` preserves that order, and
 the phase 3 reduce uses a deterministic tie-break.
+
+Fixed-slice mode (`--fixed`) reuses the same round loop and the same
+per-range evaluators, but skips phase 1 (range discovery) and phase 2's
+parallelism: there is exactly one range — the whole slice `[0, len)` — so
+each round evaluates just that, with the Tm threshold disabled as a gate.
 
 ## Tm calculation
 
