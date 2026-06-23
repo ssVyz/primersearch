@@ -84,6 +84,14 @@ pub fn format_results<W: Write>(
         thousands(result.total_sequences)
     )?;
     writeln!(w, "Primers Found:    {}", result.primers.len())?;
+    let injected_count = result.primers.iter().filter(|p| p.injected).count();
+    if injected_count > 0 {
+        writeln!(
+            w,
+            "Injected Oligos:  {} (obligatory; listed first, marked [injected])",
+            injected_count
+        )?;
+    }
     if settings.fixed {
         writeln!(
             w,
@@ -165,17 +173,23 @@ pub fn format_results<W: Write>(
         let pct_s = format!("{:.1}%", p.coverage_pct);
         let cum_s = format!("{:.1}%", cumulative);
         let tm_s = format!("{:.1}", p.tm);
+        // The position is the last column, so an injected marker can be
+        // appended without disturbing the alignment of the other columns.
+        let pos_s = if p.injected {
+            format!("{}-{} [injected]", p.align_start + 1, p.align_end)
+        } else {
+            format!("{}-{}", p.align_start + 1, p.align_end)
+        };
         writeln!(
             w,
-            "{:>w1$}   {:<w2$}   {:>w3$}   {:>6}   {:>7}   {:>6}   {}-{}",
+            "{:>w1$}   {:<w2$}   {:>w3$}   {:>6}   {:>7}   {:>6}   {}",
             i + 1,
             formatted_seqs[i],
             thousands(p.coverage_count),
             pct_s,
             cum_s,
             tm_s,
-            p.align_start + 1,
-            p.align_end,
+            pos_s,
             w1 = num_w,
             w2 = max_seq_len,
             w3 = max_count_len,

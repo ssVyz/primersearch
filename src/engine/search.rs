@@ -36,6 +36,7 @@ use crate::engine::types::{
 pub fn find_primers(
     sequences: &[Vec<u8>],
     settings: &SearchSettings,
+    injected: &[Vec<u8>],
     progress: &dyn Progress,
 ) -> PrimerSearchResult {
     let total = sequences.len();
@@ -52,6 +53,19 @@ pub fn find_primers(
     let seq_len = sequences[0].len();
 
     let mut remaining: BTreeSet<usize> = (0..total).collect();
+
+    // Obligatory user-supplied oligos are placed first; the sequences they
+    // cover are removed from the pool before the search begins.
+    apply_injected_oligos(
+        sequences,
+        injected,
+        &mut remaining,
+        &mut result,
+        &tm_params,
+        is_reverse,
+        progress,
+    );
+
     let mut round = 0;
 
     while !remaining.is_empty() {
@@ -189,6 +203,7 @@ pub fn find_primers(
 pub fn find_primers_fixed(
     sequences: &[Vec<u8>],
     settings: &SearchSettings,
+    injected: &[Vec<u8>],
     progress: &dyn Progress,
 ) -> PrimerSearchResult {
     let total = sequences.len();
@@ -213,6 +228,19 @@ pub fn find_primers_fixed(
     eval_settings.tm_threshold = f64::NEG_INFINITY;
 
     let mut remaining: BTreeSet<usize> = (0..total).collect();
+
+    // Obligatory user-supplied oligos are placed first; the sequences they
+    // cover are removed before variants are generated for the fixed slice.
+    apply_injected_oligos(
+        sequences,
+        injected,
+        &mut remaining,
+        &mut result,
+        &tm_params,
+        is_reverse,
+        progress,
+    );
+
     let mut round = 0;
 
     while !remaining.is_empty() {
@@ -300,6 +328,107 @@ fn make_primer(best: &EvalResult, total: usize, is_reverse: bool) -> PrimerCandi
         align_start: best.start,
         align_end: best.end,
         ambiguity_count: best.amb_count,
+        injected: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Injected (obligatory) oligos
+// ---------------------------------------------------------------------------
+
+/// Place the user-supplied obligatory oligos before the search runs.
+///
+/// Each `oligo` is given in *display* orientation (exactly as the user typed
+/// it). For a reverse-orientation run that means it is the reverse complement
+/// of the alignment slice it binds, so it is reverse-complemented back into
+/// forward alignment coordinates before matching — mirroring how the search
+/// stores forward consensuses and only reverse-complements for display.
+///
+/// For each oligo we:
+///   1. choose the alignment start that maximises coverage over the *full*
+///      input set (tie-break: smallest start) — the oligo's intrinsic
+///      best-fit position, independent of processing order;
+///   2. emit it as a [`PrimerCandidate`] (`injected = true`) whose reported
+///      coverage is the number of *still-uncovered* sequences it matches at
+///      that position — the same greedy accounting the search loops use;
+///   3. remove those sequences from `remaining`.
+///
+/// Injected oligos are obligatory: the Tm threshold and the
+/// ambiguity/3'/IUPAC constraints are **not** enforced. Each oligo's Tm and
+/// ambiguity count are still computed and reported. Oligos may contain IUPAC
+/// ambiguity codes (e.g. an existing degenerate primer).
+fn apply_injected_oligos(
+    sequences: &[Vec<u8>],
+    injected: &[Vec<u8>],
+    remaining: &mut BTreeSet<usize>,
+    result: &mut PrimerSearchResult,
+    tm_params: &TmParams,
+    is_reverse: bool,
+    progress: &dyn Progress,
+) {
+    if injected.is_empty() {
+        return;
+    }
+    let total = sequences.len();
+    let seq_len = sequences.first().map(|s| s.len()).unwrap_or(0);
+
+    for (i, oligo) in injected.iter().enumerate() {
+        // Forward alignment form: undo the display-time reverse complement.
+        let forward = if is_reverse {
+            reverse_complement(oligo)
+        } else {
+            oligo.clone()
+        };
+        let l = forward.len();
+        // An empty or over-long oligo cannot be placed at any position; the
+        // CLI validates these away, so this is only a defensive guard.
+        if l == 0 || l > seq_len {
+            continue;
+        }
+
+        progress.report(
+            &format!("Injecting oligo {}/{}", i + 1, injected.len()),
+            0.0,
+        );
+
+        // 1. Intrinsic position: the start covering the most input sequences.
+        let mut best_start = 0usize;
+        let mut best_cov = 0usize;
+        for start in 0..=(seq_len - l) {
+            let cov = sequences
+                .iter()
+                .filter(|s| sequence_matches_consensus(&s[start..start + l], &forward))
+                .count();
+            if cov > best_cov {
+                best_cov = cov;
+                best_start = start;
+            }
+        }
+        let (start, end) = (best_start, best_start + l);
+
+        // 2. Credit only the still-uncovered sequences, and remove them.
+        let covered: Vec<usize> = remaining
+            .iter()
+            .copied()
+            .filter(|&j| sequence_matches_consensus(&sequences[j][start..end], &forward))
+            .collect();
+        for j in &covered {
+            remaining.remove(j);
+        }
+
+        let amb_count = forward.iter().filter(|&&b| is_ambiguous(b)).count();
+        let eval = EvalResult {
+            start,
+            end,
+            sequence: forward,
+            count: covered.len(),
+            local_indices: covered,
+            amb_count,
+            tm: calculate_tm(oligo, tm_params),
+        };
+        let mut primer = make_primer(&eval, total, is_reverse);
+        primer.injected = true;
+        result.primers.push(primer);
     }
 }
 
@@ -789,7 +918,7 @@ mod tests {
         let c = b"TTTTGGGGCCCCAAAA".to_vec(); // count 1
         let seqs = vec![a.clone(), a.clone(), a.clone(), b.clone(), b.clone(), c.clone()];
 
-        let res = find_primers_fixed(&seqs, &settings, &NoProgress);
+        let res = find_primers_fixed(&seqs, &settings, &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 3, "one variant per distinct slice");
         assert_eq!(res.primers[0].coverage_count, 3);
@@ -812,7 +941,7 @@ mod tests {
         let low = b"AAATAAATAAATAAAT".to_vec();
         let seqs = vec![low.clone(), low.clone(), low.clone()];
 
-        let res = find_primers_fixed(&seqs, &settings, &NoProgress);
+        let res = find_primers_fixed(&seqs, &settings, &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 1);
         assert_eq!(res.primers[0].coverage_count, 3);
@@ -831,7 +960,7 @@ mod tests {
         let b = b"ACGTACGTACGTACGG".to_vec(); // differs only at the last base
         let seqs = vec![a.clone(), a.clone(), b.clone()];
 
-        let res = find_primers_fixed(&seqs, &settings, &NoProgress);
+        let res = find_primers_fixed(&seqs, &settings, &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 1, "merged into a single consensus");
         assert_eq!(res.primers[0].coverage_count, 3);
@@ -849,10 +978,160 @@ mod tests {
         let s = b"AAAACCCCGGGGTTTT".to_vec();
         let seqs = vec![s.clone(), s.clone()];
 
-        let res = find_primers_fixed(&seqs, &settings, &NoProgress);
+        let res = find_primers_fixed(&seqs, &settings, &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 1);
         assert_eq!(res.primers[0].sequence, reverse_complement(&s));
         assert_eq!((res.primers[0].align_start, res.primers[0].align_end), (0, 16));
+    }
+
+    /// A `SearchSettings` for the regular (non-fixed) search. `tm_threshold`
+    /// is 0 so the search itself never gates anything out — these tests are
+    /// about the injection step, not the Tm filter.
+    fn search_settings(mode: SearchMode) -> SearchSettings {
+        SearchSettings {
+            tm_threshold: 0.0,
+            oligo_concentration_um: 0.2,
+            na_concentration_mm: 50.0,
+            mg_concentration_mm: 3.0,
+            dntp_concentration_mm: 0.8,
+            mode,
+            target_coverage_pct: 100.0,
+            max_ambiguities: 2,
+            exclude_n: false,
+            only_twofold: false,
+            orientation: Orientation::Forward,
+            three_prime_match: 0,
+            max_seeds: 0,
+            fixed: false,
+        }
+    }
+
+    /// Injected oligos are emitted first, in input order, each marked
+    /// `injected`, and the sequences they cover are removed so the search
+    /// adds nothing when injection already reaches 100%.
+    #[test]
+    fn injected_oligos_listed_first_and_remove_coverage() {
+        let settings = search_settings(SearchMode::NoAmbiguities);
+        let a = b"ACGTACGTACGTACGT".to_vec();
+        let b = b"TTTTGGGGCCCCAAAA".to_vec();
+        let seqs = vec![a.clone(), a.clone(), a.clone(), b.clone(), b.clone()];
+        // Inject both exact slices, B before A, to check order is preserved.
+        let injected = vec![b.clone(), a.clone()];
+
+        let res = find_primers(&seqs, &settings, &injected, &NoProgress);
+
+        assert_eq!(res.primers.len(), 2, "only the injected oligos were needed");
+        assert!(res.primers.iter().all(|p| p.injected));
+        assert_eq!(res.primers[0].sequence, b);
+        assert_eq!(res.primers[0].coverage_count, 2);
+        assert_eq!(res.primers[1].sequence, a);
+        assert_eq!(res.primers[1].coverage_count, 3);
+        let covered: usize = res.primers.iter().map(|p| p.coverage_count).sum();
+        assert_eq!(covered, seqs.len());
+    }
+
+    /// An oligo shorter than the alignment is placed at the offset where it
+    /// covers the most input sequences, and the reported range reflects that
+    /// offset (1-based for display is handled by the formatter).
+    #[test]
+    fn injected_oligo_positioned_at_best_offset() {
+        let settings = search_settings(SearchMode::NoAmbiguities);
+        let s1 = b"AAAAGGGGTTTTCCCC".to_vec();
+        let s2 = b"CCCCGGGGAAAATTTT".to_vec();
+        let seqs = vec![s1, s2];
+        let injected = vec![b"GGGG".to_vec()]; // common motif at offset 4
+
+        let res = find_primers(&seqs, &settings, &injected, &NoProgress);
+
+        let inj = &res.primers[0];
+        assert!(inj.injected);
+        assert_eq!((inj.align_start, inj.align_end), (4, 8));
+        assert_eq!(inj.coverage_count, 2);
+    }
+
+    /// In a reverse-orientation run the user supplies the oligo in display
+    /// (reverse-complement) form; it is matched in forward coordinates and
+    /// echoed back in the form provided.
+    #[test]
+    fn injected_oligo_reverse_orientation_matches_rc() {
+        let mut settings = search_settings(SearchMode::NoAmbiguities);
+        settings.orientation = Orientation::Reverse;
+        // Non-palindromic, so reverse_complement(s) != s — this genuinely
+        // exercises the display-form -> forward-coordinate round trip.
+        let s = b"AAAACCCCGGGGTTTA".to_vec();
+        let seqs = vec![s.clone(), s.clone()];
+        let rc = reverse_complement(&s);
+        assert_ne!(rc, s, "test setup: sequence must not be self-complementary");
+        let injected = vec![rc.clone()];
+
+        let res = find_primers(&seqs, &settings, &injected, &NoProgress);
+
+        assert_eq!(res.primers.len(), 1);
+        let p = &res.primers[0];
+        assert!(p.injected);
+        assert_eq!(p.coverage_count, 2);
+        assert_eq!(p.sequence, rc);
+        assert_eq!((p.align_start, p.align_end), (0, 16));
+    }
+
+    /// An injected oligo may carry IUPAC ambiguity codes; it then covers
+    /// every input variant the code admits, and its ambiguity count is
+    /// reported.
+    #[test]
+    fn injected_ambiguous_oligo_covers_variants() {
+        let settings = search_settings(SearchMode::NoAmbiguities);
+        let a = b"ACGTACGTACGTACGA".to_vec();
+        let g = b"ACGTACGTACGTACGG".to_vec(); // differs only at the last base
+        let seqs = vec![a.clone(), a.clone(), g.clone()];
+        let injected = vec![b"ACGTACGTACGTACGR".to_vec()]; // R = {A, G}
+
+        let res = find_primers(&seqs, &settings, &injected, &NoProgress);
+
+        assert_eq!(res.primers.len(), 1);
+        let p = &res.primers[0];
+        assert!(p.injected);
+        assert_eq!(p.coverage_count, 3);
+        assert_eq!(p.ambiguity_count, 1);
+        assert_eq!(p.sequence, b"ACGTACGTACGTACGR".to_vec());
+    }
+
+    /// Injection runs first; the search then covers whatever the injected
+    /// oligos left behind, and those primers are not marked injected.
+    #[test]
+    fn injection_then_search_covers_remainder() {
+        let settings = search_settings(SearchMode::NoAmbiguities);
+        let a = b"ACGTACGTACGTACGT".to_vec();
+        let b = b"TTTTTTTTGGGGGGGG".to_vec();
+        let seqs = vec![a.clone(), a.clone(), a.clone(), b.clone(), b.clone()];
+        let injected = vec![a.clone()]; // covers the 3 A's; B's left for search
+
+        let res = find_primers(&seqs, &settings, &injected, &NoProgress);
+
+        assert!(res.primers[0].injected);
+        assert_eq!(res.primers[0].coverage_count, 3);
+        assert!(res.primers[1..].iter().all(|p| !p.injected));
+        let covered: usize = res.primers.iter().map(|p| p.coverage_count).sum();
+        assert_eq!(covered, seqs.len(), "100% coverage overall");
+    }
+
+    /// Injection composes with fixed-slice mode: injected oligos are placed
+    /// first, then the fixed-slice loop generates variants for the rest.
+    #[test]
+    fn injected_oligo_in_fixed_mode() {
+        let settings = fixed_settings(SearchMode::NoAmbiguities);
+        let a = b"GCGCGCGCGCGCGCGC".to_vec();
+        let b = b"ATATATATATATATAT".to_vec();
+        let seqs = vec![a.clone(), a.clone(), b.clone()];
+        let injected = vec![a.clone()];
+
+        let res = find_primers_fixed(&seqs, &settings, &injected, &NoProgress);
+
+        assert_eq!(res.primers.len(), 2);
+        assert!(res.primers[0].injected);
+        assert_eq!(res.primers[0].coverage_count, 2);
+        assert!(!res.primers[1].injected);
+        assert_eq!(res.primers[1].coverage_count, 1);
+        assert_eq!(res.primers[1].sequence, b);
     }
 }

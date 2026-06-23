@@ -67,6 +67,11 @@ pub struct PrimerCandidate {
     pub align_start: usize,
     pub align_end: usize,
     pub ambiguity_count: usize,
+    /// `true` if this primer was supplied by the user via `--inject` rather
+    /// than discovered by the search. Injected oligos are obligatory: they
+    /// are placed before the search runs and emitted regardless of Tm or the
+    /// variant-generation constraints.
+    pub injected: bool,
 }
 
 #[derive(Debug, Clone, Default)]

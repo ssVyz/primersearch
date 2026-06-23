@@ -58,6 +58,7 @@ primersearch input.fasta -o results.txt
 primersearch input.fasta -o results.txt --rev
 primersearch input.fasta --tm 62 --na 200 --mode incremental --target 60 --max-amb 3 --exclude-n --three-prime 5
 primersearch slice.fasta --fixed --mode incremental --max-amb 3   # generate variants for a fixed slice
+primersearch input.fasta --inject ACGTTGCACGTACGTACGT   # force one or more obligatory oligos
 primersearch --mkini                 # write defaults to settings.ini
 primersearch input.fasta -j 8        # 8 worker threads
 primersearch input.fasta --silent    # no progress / info output
@@ -89,6 +90,46 @@ Tm is still computed and reported so you can judge the choice. The input is
 still quality-filtered (same length, A/C/G/T only), and every primer's
 reported position spans the full slice.
 
+### Injecting obligatory oligos
+
+`--inject` lets you hand the tool one or more oligos that it **must** include
+in the primer set — for example primers you have already validated in the lab
+and want to keep, while letting the search fill in coverage for whatever they
+miss.
+
+Injected oligos are processed *before* the search runs (before any new
+positions are searched or new variants generated):
+
+1. Each oligo is positioned at the alignment offset where it covers the most
+   input sequences (its intrinsic best-fit position).
+2. It is emitted as a primer (listed first, marked `[injected]` in the output)
+   whose reported coverage is the number of sequences it matches.
+3. The sequences it covers are removed from the pool, so the search only has
+   to cover what the injected oligos left behind.
+
+Supply several oligos by repeating the flag or with a comma-separated list:
+
+```
+primersearch input.fasta --inject ACGTTGCA... --inject GGCATTAC...
+primersearch input.fasta --inject ACGTTGCA...,GGCATTAC...
+```
+
+Details:
+
+- Oligos may contain IUPAC ambiguity codes (e.g. an existing degenerate
+  primer); each one then covers every A/C/G/T variant the codes admit.
+- Provide oligos in the **same orientation as the run**. For a `--rev` run
+  that means the reverse-complement form you would actually order; it is
+  matched in alignment coordinates and echoed back in the form you supplied.
+- Injected oligos are **obligatory**: the Tm threshold and the
+  ambiguity / 3' / IUPAC restrictions are *not* enforced on them. They are
+  always emitted, and their Tm and ambiguity count are still computed and
+  reported so you can judge them. (The regular search applied to the leftover
+  sequences still respects all of those constraints.)
+- An oligo longer than the alignment, empty, or containing a non-IUPAC
+  character is rejected with an error before the run starts.
+- `--inject` works in both the regular search and `--fixed` mode.
+
 ### Settings precedence
 
 `built-in defaults` < `settings.ini` < `CLI flags`. The settings file
@@ -113,6 +154,7 @@ defaults file, or pass `--config <path>` to point at an alternative.
 | `--max-amb N` | Maximum ambiguity codes per primer (incremental) |
 | `--exclude-n` / `--only-twofold` | IUPAC restrictions (incremental) |
 | `--three-prime N` | Number of 3' bases that must be perfectly conserved |
+| `--inject OLIGO` | Obligatory oligo placed before the search (repeatable / comma-separated). See "Injecting obligatory oligos" |
 | `--max-seeds N` | Per-range seed cap in incremental mode (0 = no cap, default 50) |
 | `-j, --threads N` | Worker threads (0 = all logical cores) |
 | `-s, --silent` | Suppress progress / info |

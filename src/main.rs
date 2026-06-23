@@ -85,11 +85,19 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err("no valid sequences after quality filtering".into());
     }
 
+    // Validate any user-supplied obligatory oligos against the alignment
+    // length now that we know the valid sequences share one length.
+    let align_len = report.valid_sequences[0].len();
+    let injected = cli::prepare_injected(&args.inject, align_len)?;
+    if !args.silent && !injected.is_empty() {
+        eprintln!("primersearch: injecting {} obligatory oligo(s)", injected.len());
+    }
+
     let progress = CliProgress::new(args.silent);
     let result = if settings.fixed {
-        find_primers_fixed(&report.valid_sequences, &settings, &progress)
+        find_primers_fixed(&report.valid_sequences, &settings, &injected, &progress)
     } else {
-        find_primers(&report.valid_sequences, &settings, &progress)
+        find_primers(&report.valid_sequences, &settings, &injected, &progress)
     };
     progress.finish();
 

@@ -16,7 +16,7 @@ pub mod tm;
 mod types;
 
 pub use fasta::{parse_fasta, quality_filter};
-pub use iupac::{is_ambiguous, reverse_complement};
+pub use iupac::{base_mask, is_ambiguous, reverse_complement};
 pub use search::{find_primers, find_primers_fixed};
 pub use tm::{calculate_tm, determine_oligo_length, TmParams};
 pub use types::{

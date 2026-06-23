@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, ValueEnum};
 
 use crate::config::ConfigFile;
-use crate::engine::{Orientation, SearchMode, SearchSettings};
+use crate::engine::{base_mask, Orientation, SearchMode, SearchSettings};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -119,6 +119,19 @@ pub struct Args {
     /// Render primer sequences without spacers; overrides settings.ini.
     #[arg(long, conflicts_with = "spacer")]
     pub no_spacer: bool,
+
+    /// Obligatory oligo(s) to use. Each given oligo is placed before the
+    /// search runs: it is positioned at the alignment offset where it covers
+    /// the most input sequences, emitted as a primer, and the sequences it
+    /// covers are removed before any new variants are generated. Repeat the
+    /// flag or pass a comma-separated list for several oligos (e.g.
+    /// `--inject ACGT... --inject TTGC...` or `--inject ACGT...,TTGC...`).
+    /// Oligos may contain IUPAC ambiguity codes. Provide them in the same
+    /// orientation as the run (so for `--rev`, the reverse-complement form you
+    /// would order). The Tm threshold and ambiguity/3' constraints are not
+    /// enforced on injected oligos.
+    #[arg(long = "inject", value_name = "OLIGO", value_delimiter = ',')]
+    pub inject: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -192,4 +205,42 @@ pub fn resolve(args: &Args, cfg: &ConfigFile) -> ResolvedConfig {
     }
 
     ResolvedConfig { settings, add_spacer }
+}
+
+/// Validate and normalise the `--inject` oligo strings against the alignment
+/// length. Returns the cleaned oligos (whitespace-stripped, uppercased, in
+/// display orientation) ready to hand to the engine, or an error describing
+/// the first problem found. Empty input yields an empty vec.
+pub fn prepare_injected(raw: &[String], align_len: usize) -> Result<Vec<Vec<u8>>, String> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (i, s) in raw.iter().enumerate() {
+        let oligo: Vec<u8> = s
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .map(|b| b.to_ascii_uppercase())
+            .collect();
+        if oligo.is_empty() {
+            return Err(format!("injected oligo #{} is empty", i + 1));
+        }
+        if let Some(&bad) = oligo.iter().find(|&&b| base_mask(b) == 0) {
+            return Err(format!(
+                "injected oligo #{} ({}) contains invalid base '{}': only \
+                 A/C/G/T and IUPAC ambiguity codes are allowed",
+                i + 1,
+                String::from_utf8_lossy(&oligo),
+                bad as char,
+            ));
+        }
+        if oligo.len() > align_len {
+            return Err(format!(
+                "injected oligo #{} (length {}) is longer than the alignment \
+                 (length {})",
+                i + 1,
+                oligo.len(),
+                align_len,
+            ));
+        }
+        out.push(oligo);
+    }
+    Ok(out)
 }
