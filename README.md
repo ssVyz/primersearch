@@ -141,7 +141,9 @@ defaults file, or pass `--config <path>` to point at an alternative.
 
 | flag | meaning |
 |------|---------|
-| `-o, --output FILE` | Output file (default `output.txt`) |
+| `-o, --output FILE` | Output destination. Text mode defaults to `output.txt`; JSON mode defaults to stdout. `-o -` forces stdout in either mode |
+| `--format {text,json}` | Output format (default `text`). `json` emits a structured document for programmatic consumers; see "Programmatic / subprocess use" |
+| `--no-config` | Ignore the settings file entirely: built-in defaults overlaid by CLI flags only, no `settings.ini` read or created |
 | `--rev` / `--fwd` | Search reverse / forward orientation |
 | `--tm C` | Minimum Tm in °C |
 | `--oligo UM` | Oligo (primer) concentration in µM |
@@ -177,6 +179,47 @@ The output file contains:
 The same preprocessing report is also written to stdout during the run
 so you can abort early if the input data looks bad. Progress messages
 go to stderr (and are suppressed by `--silent`).
+
+## Programmatic / subprocess use
+
+primersearch is designed to be driven as a child process by another tool
+(e.g. a GUI front-end) that passes inputs as CLI flags and captures the
+result. For that use, three opt-in flags make a run self-describing,
+deterministic, and easy to capture:
+
+```
+primersearch input.fasta --format json --no-config --silent [other flags...]
+```
+
+- `--format json` emits a single JSON document instead of the text table.
+  By default it goes to **stdout** (use `-o FILE` to write it to a file
+  instead); in JSON mode the human-readable preprocessing echo on stdout is
+  suppressed so stdout carries *only* the JSON.
+- `--no-config` makes the run depend solely on built-in defaults plus the
+  flags you pass — no `settings.ini` is read or created, so the result does
+  not depend on hidden file state or the binary's location/permissions.
+- `--silent` suppresses the progress spinner and the `primersearch: …`
+  informational lines on stderr. Errors are *not* suppressed: any failure
+  still prints `error: …` to stderr and exits non-zero (exit code `1`;
+  argument-parsing errors exit `2`).
+
+The JSON document (`format_version: 1`) has three top-level objects:
+
+- `preprocessing` — `original_count`, `valid_count`, `majority_length`, and
+  a `removed` breakdown (`gaps`, `ambiguous`, `invalid`, `wrong_length`,
+  `total`).
+- `settings` — the fully resolved run settings (`mode`, `fixed`,
+  `orientation`, Tm and concentrations, `tm_threshold_enforced` — `false`
+  in fixed mode — etc.).
+- `result` — `total_sequences`, `primer_count`, `injected_count`,
+  `message`, and a `primers` array. Each primer has `index`, `sequence`
+  (display orientation, no spacers), `coverage_count`, `coverage_pct`,
+  `cumulative_pct`, `tm`, `ambiguity_count`, `injected`, the zero-based
+  half-open range `align_start` / `align_end`, and a 1-based
+  `position_label` (e.g. `"9-20"`) matching the text output.
+
+Bump-guard on `format_version` before parsing; it increments only on a
+backward-incompatible shape change.
 
 ## How it works
 

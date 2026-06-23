@@ -20,13 +20,30 @@ pub struct Args {
     #[arg(required_unless_present = "mkini")]
     pub input: Option<PathBuf>,
 
-    /// Output file.
-    #[arg(short = 'o', long, default_value = "output.txt")]
-    pub output: PathBuf,
+    /// Output destination. In text mode this defaults to `output.txt`; in
+    /// JSON mode (`--format json`) it defaults to stdout. Pass `-o -` to force
+    /// writing to stdout in either mode.
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
+
+    /// Output format. `text` (default) writes the human-readable preprocessing
+    /// report and primer table. `json` writes a single structured document for
+    /// programmatic consumers (e.g. a GUI driving primersearch as a
+    /// subprocess); it goes to stdout by default and suppresses the
+    /// human-readable preprocessing echo on stdout.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: CliOutputFormat,
 
     /// Path to settings.ini (default: next to the executable).
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Ignore any settings file: use built-in defaults overlaid by CLI flags
+    /// only. No settings.ini is read or created. Useful when driving
+    /// primersearch as a subprocess where every parameter is passed explicitly
+    /// and a deterministic, side-effect-free run is wanted.
+    #[arg(long, conflicts_with_all = ["mkini", "config"])]
+    pub no_config: bool,
 
     /// Write a default settings.ini (next to the executable, or to --config
     /// if given) and exit. Overwrites any existing file at that path.
@@ -138,6 +155,12 @@ pub struct Args {
 pub enum CliSearchMode {
     NoAmbiguities,
     Incremental,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliOutputFormat {
+    Text,
+    Json,
 }
 
 pub struct ResolvedConfig {

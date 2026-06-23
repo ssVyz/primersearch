@@ -1,16 +1,21 @@
 mod cli;
 mod config;
 mod engine;
+mod json_output;
 mod output;
 mod progress;
 
 use std::fs;
 use std::io::{BufWriter, Write};
+use std::path::Path;
 
 use clap::Parser;
 
-use crate::cli::Args;
-use crate::engine::{find_primers, find_primers_fixed, parse_fasta, quality_filter};
+use crate::cli::{Args, CliOutputFormat};
+use crate::engine::{
+    find_primers, find_primers_fixed, parse_fasta, quality_filter, PrimerSearchResult,
+    QualityReport, SearchSettings,
+};
 use crate::progress::CliProgress;
 
 fn main() {
@@ -48,20 +53,31 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let (cfg, created) = config::load_or_create(&config_path)?;
+    // Resolve configuration. With `--no-config` no settings file is read or
+    // created: built-in defaults are overlaid by CLI flags only, so the run is
+    // fully deterministic and free of filesystem side effects (handy when
+    // driving primersearch as a subprocess).
+    let cfg = if args.no_config {
+        if !args.silent {
+            eprintln!("primersearch: ignoring settings file (--no-config)");
+        }
+        config::ConfigFile::default()
+    } else {
+        let (cfg, created) = config::load_or_create(&config_path)?;
+        if !args.silent {
+            if created {
+                eprintln!(
+                    "primersearch: created defaults at {}",
+                    config_path.display()
+                );
+            } else {
+                eprintln!("primersearch: using config {}", config_path.display());
+            }
+        }
+        cfg
+    };
     let resolved = cli::resolve(&args, &cfg);
     let settings = resolved.settings;
-
-    if !args.silent {
-        if created {
-            eprintln!(
-                "primersearch: created defaults at {}",
-                config_path.display()
-            );
-        } else {
-            eprintln!("primersearch: using config {}", config_path.display());
-        }
-    }
 
     // `input` is required unless `--mkini` is used, which we already handled.
     let input_path = args
@@ -74,7 +90,18 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let raw = parse_fasta(&input_text);
     let report = quality_filter(raw);
 
-    if !args.silent {
+    // Decide where output goes. Text mode defaults to a file (`output.txt`);
+    // JSON mode defaults to stdout. `-o -` forces stdout in either mode.
+    let to_stdout = match args.output.as_deref() {
+        Some(p) => p == Path::new("-"),
+        None => matches!(args.format, CliOutputFormat::Json),
+    };
+
+    // The human-readable preprocessing echo to stdout (so an interactive user
+    // can abort early on bad input) only applies to text mode writing to a
+    // file. In JSON mode stdout is reserved for the JSON document; when text
+    // output itself goes to stdout the report is already part of it.
+    if !args.silent && matches!(args.format, CliOutputFormat::Text) && !to_stdout {
         let stdout = std::io::stdout();
         let mut h = stdout.lock();
         output::format_quality_report(&report, &mut h)?;
@@ -101,20 +128,52 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     progress.finish();
 
-    let out_file = fs::File::create(&args.output)
-        .map_err(|e| format!("failed to open {} for writing: {e}", args.output.display()))?;
-    let mut w = BufWriter::new(out_file);
-    output::format_quality_report(&report, &mut w)?;
-    output::format_results(&result, &settings, resolved.add_spacer, &mut w)?;
-    w.flush()?;
+    let dest_label = if to_stdout {
+        let stdout = std::io::stdout();
+        let mut w = stdout.lock();
+        write_output(&args, &report, &result, &settings, resolved.add_spacer, &mut w)?;
+        w.flush()?;
+        "<stdout>".to_string()
+    } else {
+        // In text mode the default destination is `output.txt`; JSON mode only
+        // reaches this branch when an explicit `-o <file>` was given.
+        let path = args.output.as_deref().unwrap_or_else(|| Path::new("output.txt"));
+        let out_file = fs::File::create(path)
+            .map_err(|e| format!("failed to open {} for writing: {e}", path.display()))?;
+        let mut w = BufWriter::new(out_file);
+        write_output(&args, &report, &result, &settings, resolved.add_spacer, &mut w)?;
+        w.flush()?;
+        path.display().to_string()
+    };
 
     if !args.silent {
         eprintln!(
             "primersearch: {} primer(s) found, wrote {}",
             result.primers.len(),
-            args.output.display()
+            dest_label
         );
     }
 
+    Ok(())
+}
+
+/// Render the run to `w` in the format selected by `--format`.
+fn write_output<W: Write>(
+    args: &Args,
+    report: &QualityReport,
+    result: &PrimerSearchResult,
+    settings: &SearchSettings,
+    add_spacer: bool,
+    w: &mut W,
+) -> std::io::Result<()> {
+    match args.format {
+        CliOutputFormat::Text => {
+            output::format_quality_report(report, w)?;
+            output::format_results(result, settings, add_spacer, w)?;
+        }
+        CliOutputFormat::Json => {
+            json_output::write_json(report, result, settings, w)?;
+        }
+    }
     Ok(())
 }
