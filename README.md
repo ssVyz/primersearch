@@ -59,6 +59,7 @@ primersearch input.fasta -o results.txt --rev
 primersearch input.fasta --tm 62 --na 200 --mode incremental --target 60 --max-amb 3 --exclude-n --three-prime 5
 primersearch slice.fasta --fixed --mode incremental --max-amb 3   # generate variants for a fixed slice
 primersearch input.fasta --inject ACGTTGCACGTACGTACGT   # force one or more obligatory oligos
+primersearch input.fasta --exclude CTAAATCYCGTG          # forbid candidates matching a 3' signature
 primersearch --mkini                 # write defaults to settings.ini
 primersearch input.fasta -j 8        # 8 worker threads
 primersearch input.fasta --silent    # no progress / info output
@@ -130,6 +131,58 @@ Details:
   character is rejected with an error before the run starts.
 - `--inject` works in both the regular search and `--fixed` mode.
 
+### Excluding primers by 3' signature
+
+`--exclude` lets you hand the tool one or more primer sequences that the search
+must **not** reproduce — for example primers already used elsewhere in a
+multiplex, whose 3' end you want to keep clear of new candidates. Because primer
+interactions are dominated by the 3' end, the match is **anchored at the 3'
+end**:
+
+1. The candidate and the excluded primer are aligned at their 3' ends (right
+   edge).
+2. Over the shorter of the two lengths, every position must share at least one
+   base under IUPAC codes (sets must *intersect*). A single mismatch anywhere in
+   that overlap — even far from the 3' end — means it is a different signature
+   and the candidate is kept.
+3. Whenever a candidate would be the best pick for a region but matches an
+   excluded signature, it is dropped and the search takes the best
+   **non-excluded** candidate for that region instead.
+
+With `Excluded: CTAAATCYCGTG`:
+
+```
+AAACTAAATCCCGTG   -> excluded (last 12 bases match under Y={C,T})
+AAACTAAATCTCRTG   -> excluded (R={A,G} still shares G; T shares with Y)
+TAAATCYCGTG       -> excluded (shorter; its whole length matches the 3' tail)
+TTTAAACTAAATCCCGT -> kept (3'-most base differs: ...GT vs ...TG)
+AAACTAAATCCCGTGA  -> kept (extra 3' base shifts the anchor)
+GATAATCYCGTG      -> kept (matches the last 10 bases, differs at the 5' end)
+```
+
+Supply several by repeating the flag or with a comma-separated list:
+
+```
+primersearch input.fasta --exclude CTAAATCYCGTG --exclude ACGT...
+primersearch input.fasta --exclude CTAAATCYCGTG,ACGT...
+```
+
+Details:
+
+- Excluded primers may contain IUPAC ambiguity codes, and may be longer than the
+  alignment (a candidate is then matched against the excluded primer's 3' tail
+  over the candidate's own length).
+- Provide them in the **same orientation as the run**, exactly like `--inject`:
+  for a `--rev` run that means the reverse-complement form you would order.
+  Candidates are compared in their display form.
+- `--inject`ed oligos are **exempt** — they are obligatory and user-forced, so
+  they are emitted even if they match an excluded signature.
+- Exclusion applies to the regular search only. It is **ignored in `--fixed`
+  mode** (which must emit whatever covers the fixed slice); combining
+  `--exclude` with `--fixed` prints a warning.
+- Running without `--exclude` produces exactly the same results as before the
+  feature existed — the check is skipped entirely when no signatures are given.
+
 ### Settings precedence
 
 `built-in defaults` < `settings.ini` < `CLI flags`. The settings file
@@ -157,6 +210,7 @@ defaults file, or pass `--config <path>` to point at an alternative.
 | `--exclude-n` / `--only-twofold` | IUPAC restrictions (incremental) |
 | `--three-prime N` | Number of 3' bases that must be perfectly conserved |
 | `--inject OLIGO` | Obligatory oligo placed before the search (repeatable / comma-separated). See "Injecting obligatory oligos" |
+| `--exclude OLIGO` | Primer whose 3' signature must not be reproduced by the search (repeatable / comma-separated; ignored in `--fixed`). See "Excluding primers by 3' signature" |
 | `--max-seeds N` | Per-range seed cap in incremental mode (0 = no cap, default 50) |
 | `-j, --threads N` | Worker threads (0 = all logical cores) |
 | `-s, --silent` | Suppress progress / info |

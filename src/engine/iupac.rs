@@ -54,6 +54,30 @@ pub const fn mask_to_iupac(mask: u8) -> u8 {
     }
 }
 
+/// Complement an IUPAC bit-mask directly (A↔T, C↔G), so ambiguity codes are
+/// complemented as sets: e.g. `Y` = {C,T} → {G,A} = `R`. Equivalent to
+/// `base_mask(complement(mask_to_iupac(m)))` for any single canonical base,
+/// but works on arbitrary masks without a round-trip through byte codes.
+/// Used to bring a forward-coordinate consensus into display (reverse-
+/// complement) space one base at a time, without allocating.
+#[inline]
+pub const fn complement_mask(m: u8) -> u8 {
+    let mut r = 0u8;
+    if m & MASK_A != 0 {
+        r |= MASK_T;
+    }
+    if m & MASK_T != 0 {
+        r |= MASK_A;
+    }
+    if m & MASK_C != 0 {
+        r |= MASK_G;
+    }
+    if m & MASK_G != 0 {
+        r |= MASK_C;
+    }
+    r
+}
+
 #[inline]
 pub fn is_ambiguous(b: u8) -> bool {
     matches!(

@@ -149,6 +149,21 @@ pub struct Args {
     /// enforced on injected oligos.
     #[arg(long = "inject", value_name = "OLIGO", value_delimiter = ',')]
     pub inject: Vec<String>,
+
+    /// Primer sequence(s) to exclude by their 3' signature. Any candidate the
+    /// search would emit is discarded when its 3' end matches an excluded
+    /// primer: the two are aligned at their 3' ends and, over the shorter of
+    /// the two lengths, every position must share at least one base under
+    /// IUPAC codes (a single mismatch anywhere in that overlap keeps the
+    /// candidate). The search then picks the best *non-excluded* candidate
+    /// instead. Repeat the flag or pass a comma-separated list for several
+    /// oligos (e.g. `--exclude ACGT... --exclude TTGC...` or
+    /// `--exclude ACGT...,TTGC...`). Oligos may contain IUPAC ambiguity codes.
+    /// Provide them in the same orientation as the run (so for `--rev`, the
+    /// reverse-complement form you would order), matching `--inject`.
+    /// `--inject`ed oligos are exempt. Ignored in `--fixed` mode.
+    #[arg(long = "exclude", value_name = "OLIGO", value_delimiter = ',')]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -261,6 +276,39 @@ pub fn prepare_injected(raw: &[String], align_len: usize) -> Result<Vec<Vec<u8>>
                 i + 1,
                 oligo.len(),
                 align_len,
+            ));
+        }
+        out.push(oligo);
+    }
+    Ok(out)
+}
+
+/// Validate and normalise the `--exclude` oligo strings. Returns the cleaned
+/// oligos (whitespace-stripped, uppercased, in display orientation) ready to
+/// hand to the engine, or an error describing the first problem found. Empty
+/// input yields an empty vec.
+///
+/// Unlike [`prepare_injected`], there is no alignment-length cap: an excluded
+/// primer may legitimately be longer than any candidate the search can emit
+/// (candidates are then matched against its 3' tail over their own length).
+pub fn prepare_excluded(raw: &[String]) -> Result<Vec<Vec<u8>>, String> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (i, s) in raw.iter().enumerate() {
+        let oligo: Vec<u8> = s
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .map(|b| b.to_ascii_uppercase())
+            .collect();
+        if oligo.is_empty() {
+            return Err(format!("excluded oligo #{} is empty", i + 1));
+        }
+        if let Some(&bad) = oligo.iter().find(|&&b| base_mask(b) == 0) {
+            return Err(format!(
+                "excluded oligo #{} ({}) contains invalid base '{}': only \
+                 A/C/G/T and IUPAC ambiguity codes are allowed",
+                i + 1,
+                String::from_utf8_lossy(&oligo),
+                bad as char,
             ));
         }
         out.push(oligo);

@@ -23,7 +23,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rayon::prelude::*;
 
-use crate::engine::iupac::{base_mask, is_ambiguous, mask_to_iupac, reverse_complement};
+use crate::engine::iupac::{base_mask, complement_mask, is_ambiguous, mask_to_iupac, reverse_complement};
 use crate::engine::tm::{calculate_tm, determine_oligo_length, TmParams};
 use crate::engine::types::{
     Orientation, PrimerCandidate, PrimerSearchResult, Progress, SearchMode, SearchSettings,
@@ -37,6 +37,7 @@ pub fn find_primers(
     sequences: &[Vec<u8>],
     settings: &SearchSettings,
     injected: &[Vec<u8>],
+    excluded: &[Vec<u8>],
     progress: &dyn Progress,
 ) -> PrimerSearchResult {
     let total = sequences.len();
@@ -51,6 +52,11 @@ pub fn find_primers(
     let tm_params = settings.tm_params();
     let is_reverse = matches!(settings.orientation, Orientation::Reverse);
     let seq_len = sequences[0].len();
+
+    // User-supplied 3' signatures to avoid. Empty when `--exclude` is unused,
+    // in which case `ExcludeSet::excludes` short-circuits to `false` and the
+    // search behaves exactly as before this feature.
+    let exclude_set = ExcludeSet::new(excluded);
 
     let mut remaining: BTreeSet<usize> = (0..total).collect();
 
@@ -127,7 +133,15 @@ pub fn find_primers(
                 if progress.cancelled() {
                     return None;
                 }
-                evaluate_range(start, end, &remaining_seqs, settings, &tm_params, is_reverse)
+                evaluate_range(
+                    start,
+                    end,
+                    &remaining_seqs,
+                    settings,
+                    &tm_params,
+                    is_reverse,
+                    &exclude_set,
+                )
             })
             .collect();
 
@@ -200,12 +214,19 @@ pub fn find_primers(
 /// The per-variant Tm is still computed (from the configured concentrations)
 /// and reported on each primer, so a cold slice is reported, not silently
 /// dropped.
+/// `excluded` is accepted for API symmetry with [`find_primers`] but is
+/// **ignored**: 3'-signature exclusion is a search-time concept (it discards
+/// discovered candidates in favour of alternatives) and has no meaning for a
+/// fixed slice, where every variant needed for full coverage must be emitted.
+/// The CLI warns if `--exclude` is combined with `--fixed`.
 pub fn find_primers_fixed(
     sequences: &[Vec<u8>],
     settings: &SearchSettings,
     injected: &[Vec<u8>],
+    excluded: &[Vec<u8>],
     progress: &dyn Progress,
 ) -> PrimerSearchResult {
+    let _ = excluded; // exclusion does not apply in fixed mode (see above)
     let total = sequences.len();
     let mut result = PrimerSearchResult {
         total_sequences: total,
@@ -226,6 +247,10 @@ pub fn find_primers_fixed(
     // independent of `tm_threshold`.
     let mut eval_settings = settings.clone();
     eval_settings.tm_threshold = f64::NEG_INFINITY;
+
+    // Fixed mode never excludes (see the doc comment); an empty set makes the
+    // exclusion check in `evaluate_range` a no-op.
+    let no_exclude = ExcludeSet::new(&[]);
 
     let mut remaining: BTreeSet<usize> = (0..total).collect();
 
@@ -272,6 +297,7 @@ pub fn find_primers_fixed(
             &eval_settings,
             &tm_params,
             is_reverse,
+            &no_exclude,
         ) else {
             // Unreachable for non-degenerate input (with Tm gating off the
             // evaluators always yield at least the most-frequent exact
@@ -433,6 +459,67 @@ fn apply_injected_oligos(
 }
 
 // ---------------------------------------------------------------------------
+// Excluded 3' signatures
+// ---------------------------------------------------------------------------
+
+/// User-supplied "excluded" primer signatures. A discovered candidate is
+/// rejected when its 3' end matches any excluded signature: align the two at
+/// their 3' ends, take the shorter of the two lengths as the overlap, and
+/// require the IUPAC code-sets to *intersect* (share ≥1 base) at every
+/// position of that overlap. A single mismatch anywhere in the overlap — even
+/// far from the 3' end — means no match (cf. spec examples 3, 4, 7).
+///
+/// Matching is done in *display* orientation: excluded primers are supplied in
+/// display/order form (3' end on the right), and each candidate is brought
+/// into display form before comparison. Injected oligos never pass through
+/// here, so they are exempt from exclusion by construction.
+///
+/// An empty set never excludes anything, so a run without `--exclude` produces
+/// byte-for-byte identical results to before this feature existed.
+struct ExcludeSet {
+    /// One entry per excluded primer: its IUPAC bit-masks in 3'→5' order
+    /// (index 0 = the 3'-most base) — i.e. the display sequence, reversed.
+    sigs: Vec<Vec<u8>>,
+}
+
+impl ExcludeSet {
+    fn new(excluded: &[Vec<u8>]) -> Self {
+        let sigs = excluded
+            .iter()
+            .map(|e| e.iter().rev().map(|&b| base_mask(b)).collect())
+            .collect();
+        ExcludeSet { sigs }
+    }
+
+    /// Is `forward` (a candidate consensus in forward alignment coordinates)
+    /// excluded? `is_reverse` selects the display transform: forward runs show
+    /// the consensus as-is (3' end on the right), reverse runs show its reverse
+    /// complement, so the display's k-th base from the 3' end is the base-
+    /// complement of `forward[k]`. Computed without allocating a reverse
+    /// complement per candidate.
+    fn excludes(&self, forward: &[u8], is_reverse: bool) -> bool {
+        if self.sigs.is_empty() {
+            return false;
+        }
+        let lc = forward.len();
+        self.sigs.iter().any(|sig| {
+            let n = sig.len().min(lc);
+            n > 0
+                && (0..n).all(|k| {
+                    // Mask of the candidate's k-th base from the 3' end of its
+                    // display form.
+                    let cand = if is_reverse {
+                        complement_mask(base_mask(forward[k]))
+                    } else {
+                        base_mask(forward[lc - 1 - k])
+                    };
+                    cand & sig[k] != 0
+                })
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-range evaluation
 // ---------------------------------------------------------------------------
 
@@ -453,13 +540,19 @@ fn evaluate_range(
     settings: &SearchSettings,
     tm_params: &TmParams,
     is_reverse: bool,
+    exclude_set: &ExcludeSet,
 ) -> Option<EvalResult> {
     let subsequences: Vec<&[u8]> = remaining_seqs.iter().map(|s| &s[start..end]).collect();
 
     let (variant, count, local_indices, amb_count) = match settings.mode {
         SearchMode::NoAmbiguities => {
-            let (v, c, l) =
-                eval_no_ambiguities(&subsequences, settings.tm_threshold, tm_params)?;
+            let (v, c, l) = eval_no_ambiguities(
+                &subsequences,
+                settings.tm_threshold,
+                tm_params,
+                is_reverse,
+                exclude_set,
+            )?;
             (v, c, l, 0)
         }
         SearchMode::Incremental => eval_incremental(
@@ -473,6 +566,7 @@ fn evaluate_range(
             settings.max_seeds,
             settings.tm_threshold,
             tm_params,
+            exclude_set,
         )?,
     };
 
@@ -495,10 +589,16 @@ fn evaluate_range(
 /// `subsequences` — matches the reference Python implementation, which
 /// iterates a dict in insertion order with a `>` (strict-greater) update.
 /// Returns `None` if no variant at this range meets the threshold.
+///
+/// Subsequences whose 3' signature is excluded are skipped, so the most
+/// frequent *non-excluded* threshold-passing variant wins. With an empty
+/// `exclude_set` the skip never fires and the pick is unchanged.
 fn eval_no_ambiguities(
     subsequences: &[&[u8]],
     tm_threshold: f64,
     tm_params: &TmParams,
+    is_reverse: bool,
+    exclude_set: &ExcludeSet,
 ) -> Option<(Vec<u8>, usize, Vec<usize>)> {
     let mut index_of: HashMap<&[u8], usize> = HashMap::new();
     let mut entries: Vec<(&[u8], Vec<usize>)> = Vec::new();
@@ -515,6 +615,9 @@ fn eval_no_ambiguities(
     let mut best_count: usize = 0;
     for (seq, idx) in entries.into_iter() {
         if calculate_tm(seq, tm_params) < tm_threshold {
+            continue;
+        }
+        if exclude_set.excludes(seq, is_reverse) {
             continue;
         }
         if idx.len() > best_count {
@@ -558,6 +661,7 @@ fn eval_incremental(
     max_seeds: usize,
     tm_threshold: f64,
     tm_params: &TmParams,
+    exclude_set: &ExcludeSet,
 ) -> Option<(Vec<u8>, usize, Vec<usize>, usize)> {
     if subsequences.is_empty() {
         return None;
@@ -655,6 +759,16 @@ fn eval_incremental(
                 if !check_three_prime_ok(&consensus, three_prime_len, is_reverse) {
                     continue;
                 }
+                // Skip any consensus whose 3' end matches an excluded
+                // signature; the best *non-excluded* consensus for this range
+                // wins instead. Growing a consensus only widens its per-
+                // position code-sets, so an already-excluded consensus can
+                // never become non-excluded — but a clean seed can widen into
+                // an excluded one, so we must test the final consensus here.
+                // No-op when `exclude_set` is empty.
+                if exclude_set.excludes(&consensus, is_reverse) {
+                    continue;
+                }
 
                 let mut coverage_count: usize = 0;
                 let mut local_indices: Vec<usize> = Vec::new();
@@ -704,11 +818,15 @@ fn eval_incremental(
     }
 
     if best_consensus.is_none() || best_count == 0 {
-        // Fallback: most-frequent threshold-passing exact subsequence.
-        // `seed_order` is already filtered by Tm and sorted by count desc,
-        // so its first element (if any) is the right pick. If no seed
-        // passes, this range cannot yield a valid primer.
-        let &i = seed_order.first()?;
+        // Fallback: most-frequent threshold-passing, non-excluded exact
+        // subsequence. `seed_order` is already filtered by Tm and sorted by
+        // count desc, so the first seed that is not itself excluded is the
+        // right pick. If none qualifies, this range cannot yield a valid
+        // primer. (An exact seed that is excluded can only grow into excluded
+        // consensuses, so skipping it here loses nothing.)
+        let &i = seed_order
+            .iter()
+            .find(|&&i| !exclude_set.excludes(unique[i].0, is_reverse))?;
         let seq = unique[i].0.to_vec();
         let indices = unique[i].1.clone();
         let count = indices.len();
@@ -860,8 +978,8 @@ mod tests {
         assert!(calculate_tm(high, &p) >= 60.0, "test setup: high Tm");
 
         let subs: Vec<&[u8]> = vec![low, low, low, low, low, high, high];
-        let (picked, count, _) =
-            eval_no_ambiguities(&subs, 60.0, &p).expect("at least one variant passes");
+        let (picked, count, _) = eval_no_ambiguities(&subs, 60.0, &p, false, &ExcludeSet::new(&[]))
+            .expect("at least one variant passes");
         assert_eq!(picked, high.to_vec());
         assert_eq!(count, 2);
     }
@@ -873,7 +991,7 @@ mod tests {
         let p = params();
         let low: &[u8] = b"AAATAAATAAATAAAT";
         let subs: Vec<&[u8]> = vec![low, low, low];
-        assert!(eval_no_ambiguities(&subs, 80.0, &p).is_none());
+        assert!(eval_no_ambiguities(&subs, 80.0, &p, false, &ExcludeSet::new(&[])).is_none());
     }
 
     /// In incremental mode, a sub-threshold high-count seed must be
@@ -887,7 +1005,7 @@ mod tests {
         let high: &[u8] = b"GCGCGCGCGCGCGCGC";
         let subs: Vec<&[u8]> = vec![low, low, low, low, low, high, high];
         let (consensus, count, _local, _amb) = eval_incremental(
-            &subs, 100.0, 1, false, false, 0, false, 0, 60.0, &p,
+            &subs, 100.0, 1, false, false, 0, false, 0, 60.0, &p, &ExcludeSet::new(&[]),
         )
         .expect("high-Tm seed exists");
         assert_eq!(consensus, high.to_vec());
@@ -903,7 +1021,8 @@ mod tests {
         let low: &[u8] = b"AAATAAATAAATAAAT";
         let subs: Vec<&[u8]> = vec![low, low, low];
         assert!(
-            eval_incremental(&subs, 100.0, 1, false, false, 0, false, 0, 80.0, &p).is_none()
+            eval_incremental(&subs, 100.0, 1, false, false, 0, false, 0, 80.0, &p, &ExcludeSet::new(&[]))
+                .is_none()
         );
     }
 
@@ -918,7 +1037,7 @@ mod tests {
         let c = b"TTTTGGGGCCCCAAAA".to_vec(); // count 1
         let seqs = vec![a.clone(), a.clone(), a.clone(), b.clone(), b.clone(), c.clone()];
 
-        let res = find_primers_fixed(&seqs, &settings, &[], &NoProgress);
+        let res = find_primers_fixed(&seqs, &settings, &[], &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 3, "one variant per distinct slice");
         assert_eq!(res.primers[0].coverage_count, 3);
@@ -941,7 +1060,7 @@ mod tests {
         let low = b"AAATAAATAAATAAAT".to_vec();
         let seqs = vec![low.clone(), low.clone(), low.clone()];
 
-        let res = find_primers_fixed(&seqs, &settings, &[], &NoProgress);
+        let res = find_primers_fixed(&seqs, &settings, &[], &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 1);
         assert_eq!(res.primers[0].coverage_count, 3);
@@ -960,7 +1079,7 @@ mod tests {
         let b = b"ACGTACGTACGTACGG".to_vec(); // differs only at the last base
         let seqs = vec![a.clone(), a.clone(), b.clone()];
 
-        let res = find_primers_fixed(&seqs, &settings, &[], &NoProgress);
+        let res = find_primers_fixed(&seqs, &settings, &[], &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 1, "merged into a single consensus");
         assert_eq!(res.primers[0].coverage_count, 3);
@@ -978,7 +1097,7 @@ mod tests {
         let s = b"AAAACCCCGGGGTTTT".to_vec();
         let seqs = vec![s.clone(), s.clone()];
 
-        let res = find_primers_fixed(&seqs, &settings, &[], &NoProgress);
+        let res = find_primers_fixed(&seqs, &settings, &[], &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 1);
         assert_eq!(res.primers[0].sequence, reverse_complement(&s));
@@ -1019,7 +1138,7 @@ mod tests {
         // Inject both exact slices, B before A, to check order is preserved.
         let injected = vec![b.clone(), a.clone()];
 
-        let res = find_primers(&seqs, &settings, &injected, &NoProgress);
+        let res = find_primers(&seqs, &settings, &injected, &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 2, "only the injected oligos were needed");
         assert!(res.primers.iter().all(|p| p.injected));
@@ -1042,7 +1161,7 @@ mod tests {
         let seqs = vec![s1, s2];
         let injected = vec![b"GGGG".to_vec()]; // common motif at offset 4
 
-        let res = find_primers(&seqs, &settings, &injected, &NoProgress);
+        let res = find_primers(&seqs, &settings, &injected, &[], &NoProgress);
 
         let inj = &res.primers[0];
         assert!(inj.injected);
@@ -1065,7 +1184,7 @@ mod tests {
         assert_ne!(rc, s, "test setup: sequence must not be self-complementary");
         let injected = vec![rc.clone()];
 
-        let res = find_primers(&seqs, &settings, &injected, &NoProgress);
+        let res = find_primers(&seqs, &settings, &injected, &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 1);
         let p = &res.primers[0];
@@ -1086,7 +1205,7 @@ mod tests {
         let seqs = vec![a.clone(), a.clone(), g.clone()];
         let injected = vec![b"ACGTACGTACGTACGR".to_vec()]; // R = {A, G}
 
-        let res = find_primers(&seqs, &settings, &injected, &NoProgress);
+        let res = find_primers(&seqs, &settings, &injected, &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 1);
         let p = &res.primers[0];
@@ -1106,7 +1225,7 @@ mod tests {
         let seqs = vec![a.clone(), a.clone(), a.clone(), b.clone(), b.clone()];
         let injected = vec![a.clone()]; // covers the 3 A's; B's left for search
 
-        let res = find_primers(&seqs, &settings, &injected, &NoProgress);
+        let res = find_primers(&seqs, &settings, &injected, &[], &NoProgress);
 
         assert!(res.primers[0].injected);
         assert_eq!(res.primers[0].coverage_count, 3);
@@ -1125,7 +1244,7 @@ mod tests {
         let seqs = vec![a.clone(), a.clone(), b.clone()];
         let injected = vec![a.clone()];
 
-        let res = find_primers_fixed(&seqs, &settings, &injected, &NoProgress);
+        let res = find_primers_fixed(&seqs, &settings, &injected, &[], &NoProgress);
 
         assert_eq!(res.primers.len(), 2);
         assert!(res.primers[0].injected);
@@ -1133,5 +1252,129 @@ mod tests {
         assert!(!res.primers[1].injected);
         assert_eq!(res.primers[1].coverage_count, 1);
         assert_eq!(res.primers[1].sequence, b);
+    }
+
+    // ----- Excluded 3' signatures -----
+
+    /// Strip spaces from a display-orientation primer string into bytes.
+    fn seq(s: &str) -> Vec<u8> {
+        s.bytes().filter(|b| !b.is_ascii_whitespace()).collect()
+    }
+
+    /// Build an `ExcludeSet` from one display-orientation primer string.
+    fn excl(primer: &str) -> ExcludeSet {
+        ExcludeSet::new(&[seq(primer)])
+    }
+
+    /// The seven worked examples from the feature spec, matched in forward
+    /// orientation (display form == forward). Excluded primer: CTA AAT CYC GTG.
+    #[test]
+    fn exclude_signature_spec_examples() {
+        let e = excl("CTA AAT CYC GTG");
+        // Included in the 3' signature -> discarded.
+        assert!(e.excludes(&seq("AAA CTA AAT CCC GTG"), false), "ex1");
+        assert!(e.excludes(&seq("AAA CTA AAT CTC RTG"), false), "ex2");
+        assert!(e.excludes(&seq("TA AAT CYC GTG"), false), "ex5");
+        assert!(e.excludes(&seq("YYR RRY YYY RYR"), false), "ex6");
+        // Different 3' signature -> kept. ex3/ex4 differ at the 3'-most base;
+        // ex7 matches the last 10 bases but differs at the 5' end of the
+        // equal-length overlap, so the whole-overlap match fails.
+        assert!(!e.excludes(&seq("TTT AAA CTA AAT CCC GT"), false), "ex3");
+        assert!(!e.excludes(&seq("AAA CTA AAT CCC GTG A"), false), "ex4");
+        assert!(!e.excludes(&seq("GAT AAT CYC GTG"), false), "ex7");
+    }
+
+    /// In a reverse run the candidate is compared in display (reverse-
+    /// complement) form. Passing the *forward* consensus (the RC of the
+    /// display candidate) reproduces the display-space match.
+    #[test]
+    fn exclude_signature_reverse_orientation() {
+        let e = excl("CTA AAT CYC GTG");
+        let ex1_fwd = reverse_complement(&seq("AAA CTA AAT CCC GTG"));
+        assert!(e.excludes(&ex1_fwd, true), "ex1 excluded in reverse run");
+        let ex7_fwd = reverse_complement(&seq("GAT AAT CYC GTG"));
+        assert!(!e.excludes(&ex7_fwd, true), "ex7 kept in reverse run");
+    }
+
+    /// An empty exclude set never excludes anything (the "no-op when unused"
+    /// contract on which identical-results-without-`--exclude` rests).
+    #[test]
+    fn empty_exclude_set_is_noop() {
+        let e = ExcludeSet::new(&[]);
+        assert!(!e.excludes(&seq("CTA AAT CYC GTG"), false));
+        assert!(!e.excludes(&seq("CTA AAT CYC GTG"), true));
+    }
+
+    /// No-ambiguities mode skips the most-frequent slice when it is excluded
+    /// and emits the next most-frequent, non-excluded slice instead.
+    #[test]
+    fn no_ambiguities_skips_excluded_top_variant() {
+        let p = params();
+        let top: &[u8] = b"ACGTACGTACGTACGT"; // count 3, excluded
+        let alt: &[u8] = b"TTTTGGGGCCCCAAAA"; // count 2, kept (3' base A != T)
+        let subs: Vec<&[u8]> = vec![top, top, top, alt, alt];
+        let e = ExcludeSet::new(&[top.to_vec()]);
+        let (picked, count, _) = eval_no_ambiguities(&subs, 0.0, &p, false, &e)
+            .expect("a non-excluded variant exists");
+        assert_eq!(picked, alt.to_vec());
+        assert_eq!(count, 2);
+    }
+
+    /// Incremental mode skips an excluded consensus in favour of the best
+    /// non-excluded one. With no ambiguity budget the excluded top seed is
+    /// dropped and the next seed drives the result.
+    #[test]
+    fn incremental_skips_excluded_consensus() {
+        let p = params();
+        let top: &[u8] = b"ACGTACGTACGTACGT"; // count 3, excluded
+        let alt: &[u8] = b"TTTTGGGGCCCCAAAA"; // count 2, kept
+        let subs: Vec<&[u8]> = vec![top, top, top, alt, alt];
+        let e = ExcludeSet::new(&[top.to_vec()]);
+        let (consensus, count, _l, _a) =
+            eval_incremental(&subs, 100.0, 0, false, false, 0, false, 0, 0.0, &p, &e)
+                .expect("a non-excluded seed exists");
+        assert_eq!(consensus, alt.to_vec());
+        assert_eq!(count, 2);
+    }
+
+    /// When every candidate at a range is excluded, incremental mode yields no
+    /// primer for that range (the fallback finds no clean seed).
+    #[test]
+    fn incremental_all_excluded_returns_none() {
+        let p = params();
+        let only: &[u8] = b"ACGTACGTACGTACGT";
+        let subs: Vec<&[u8]> = vec![only, only, only];
+        let e = ExcludeSet::new(&[only.to_vec()]);
+        assert!(
+            eval_incremental(&subs, 100.0, 2, false, false, 0, false, 0, 0.0, &p, &e).is_none()
+        );
+    }
+
+    /// End-to-end: excluding the top emitted primer's own signature removes it
+    /// from the search output, while an exclude that shares no 3' base with any
+    /// candidate leaves the result byte-for-byte identical.
+    #[test]
+    fn find_primers_excludes_emitted_candidate_and_noop() {
+        let settings = search_settings(SearchMode::NoAmbiguities);
+        // A/C-only inputs, so every candidate is A/C-only and a G-only excluded
+        // oligo can never share a 3' base with one.
+        let a = seq("ACACACACACACACAC");
+        let b = seq("AACCAACCAACCAACC");
+        let seqs = vec![a.clone(), a.clone(), a.clone(), b.clone(), b.clone()];
+
+        let plain = find_primers(&seqs, &settings, &[], &[], &NoProgress);
+        assert!(!plain.primers.is_empty(), "baseline emits primers");
+        let top = plain.primers[0].sequence.clone();
+
+        let excl_top = find_primers(&seqs, &settings, &[], &[top.clone()], &NoProgress);
+        assert!(
+            !excl_top.primers.iter().any(|pr| pr.sequence == top),
+            "an excluded signature must never be emitted"
+        );
+
+        let noop = find_primers(&seqs, &settings, &[], &[seq("GGGGGGGG")], &NoProgress);
+        let plain_seqs: Vec<_> = plain.primers.iter().map(|pr| &pr.sequence).collect();
+        let noop_seqs: Vec<_> = noop.primers.iter().map(|pr| &pr.sequence).collect();
+        assert_eq!(plain_seqs, noop_seqs, "irrelevant exclude is a no-op");
     }
 }

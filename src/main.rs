@@ -120,11 +120,26 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("primersearch: injecting {} obligatory oligo(s)", injected.len());
     }
 
+    // Excluded 3' signatures. They do not apply to fixed-slice runs (every
+    // variant needed for full coverage must be emitted there), so warn and
+    // drop them rather than silently ignoring the flag.
+    let excluded = cli::prepare_excluded(&args.exclude)?;
+    if settings.fixed && !excluded.is_empty() {
+        if !args.silent {
+            eprintln!(
+                "primersearch: --exclude is ignored in --fixed mode ({} signature(s) dropped)",
+                excluded.len()
+            );
+        }
+    } else if !args.silent && !excluded.is_empty() {
+        eprintln!("primersearch: excluding {} 3' signature(s)", excluded.len());
+    }
+
     let progress = CliProgress::new(args.silent);
     let result = if settings.fixed {
-        find_primers_fixed(&report.valid_sequences, &settings, &injected, &progress)
+        find_primers_fixed(&report.valid_sequences, &settings, &injected, &excluded, &progress)
     } else {
-        find_primers(&report.valid_sequences, &settings, &injected, &progress)
+        find_primers(&report.valid_sequences, &settings, &injected, &excluded, &progress)
     };
     progress.finish();
 
