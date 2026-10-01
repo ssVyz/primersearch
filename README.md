@@ -428,12 +428,15 @@ per window (parallel): enumerate consensus variants within reach of
     some slice, compute each one's coverage profile (mismatch level per
     sequence, as bitsets), keep only valid, non-dominated candidates
 pool: merge the windows' candidates, again keeping non-dominated ones
-branch-and-bound over sets of up to n pool candidates
+branch-and-bound over sets of up to n pool candidates (parallel branches)
 ```
 
 Results are identical across thread counts: the reduced pool does not depend
-on processing order, and the set search visits sets in a fixed order and
-keeps the first strictly best one.
+on processing order, and the set search, although it explores branches in
+parallel, breaks ties by position in a fixed visiting order and so keeps the
+same best set as a sequential search. Only the evaluation count can vary a
+little between multi-threaded runs, since a branch started in parallel may
+not yet know the best set found by an earlier one.
 
 ## Tm calculation
 

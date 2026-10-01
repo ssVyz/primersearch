@@ -27,9 +27,10 @@
 //!    in any set without making the set worse, so it is dropped. The surviving
 //!    pool does not depend on processing order.
 //! 4. **Set search.** Exact depth-first branch-and-bound over sets of up to
-//!    `n` pool candidates, pruned with submodular upper bounds. The first
-//!    strictly-best set in a fixed visiting order wins, so results do not
-//!    depend on the thread count.
+//!    `n` pool candidates, pruned with submodular upper bounds, with the
+//!    branches of large nodes explored in parallel. Ties go to the set that
+//!    comes first in a fixed visiting order, so results do not depend on the
+//!    thread count.
 //!
 //! Scoring: `lower_or_equal` maximises the number of sequences whose best
 //! match has at most `x` mismatches, ties broken by the fewest total
@@ -51,7 +52,8 @@
 //! operations weighted by sequence multiplicity.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use rayon::prelude::*;
 
@@ -70,6 +72,14 @@ const PAR_MIN_ITEMS: usize = 2048;
 /// Progress is reported (and cancellation polled) every this many
 /// evaluations during the set search.
 const REPORT_EVERY: u64 = 1 << 22;
+
+/// Set-search nodes with at least this many children explore them in
+/// parallel.
+const PAR_MIN_CHILDREN: usize = 32;
+
+/// Evaluations a set-search thread counts locally before adding them to the
+/// shared count, where the work limit is checked.
+const FLUSH_EVERY: u64 = 1 << 12;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -1546,23 +1556,23 @@ fn search_sets(
     progress: &dyn Progress,
 ) -> Result<(i64, Vec<usize>, u64), String> {
     let base = obj.union_score(&state, words, wt);
-    let mut search = SetSearch {
+    let shared = Shared {
         obj,
         wt,
         words,
         pool,
-        score: base,
-        best: base,
-        best_set: Vec::new(),
-        chosen: Vec::new(),
-        saved: vec![vec![0u64; state.len()]; slots],
-        state,
-        evals: 0,
-        max_work: limits.max_work,
-        next_report: REPORT_EVERY,
+        best: Mutex::new(Incumbent {
+            score: base,
+            path: Vec::new(),
+            set: Vec::new(),
+        }),
+        version: AtomicU64::new(0),
+        evals: AtomicU64::new(0),
+        next_report: AtomicU64::new(REPORT_EVERY),
+        failed: AtomicBool::new(false),
+        error: Mutex::new(None),
+        limits,
         progress,
-        generated: limits.generated,
-        set_size: limits.set_size,
     };
     if slots > 0 && !pool.is_empty() {
         let root: Vec<(u32, i64)> = pool
@@ -1570,56 +1580,144 @@ fn search_sets(
             .enumerate()
             .map(|(i, c)| (i as u32, c.score))
             .collect();
-        search.dfs(&root, slots, 0)?;
+        let mut worker = Worker {
+            sh: &shared,
+            saved: vec![vec![0u64; state.len()]; slots],
+            state,
+            score: base,
+            chosen: Vec::new(),
+            path: Vec::new(),
+            evals: 0,
+            seen: 0,
+            best: base,
+            best_path: Vec::new(),
+        };
+        if worker.dfs(&root, slots, 0).and_then(|()| worker.flush()).is_err() {
+            return Err(lock(&shared.error).take().unwrap_or_default());
+        }
     }
-    Ok((search.best, search.best_set, search.evals))
+    let evals = shared.evals.load(Ordering::Relaxed);
+    let best = shared.best.into_inner().unwrap_or_else(PoisonError::into_inner);
+    Ok((best.score, best.set, evals))
 }
 
-/// Depth-first branch-and-bound over sets of pool candidates.
+/// State shared by the threads of one set search.
 ///
-/// A node holds the union profile of the chosen candidates and a list of
+/// The search is a depth-first branch-and-bound over sets of pool
+/// candidates. A node holds the union profile of the chosen candidates and a list of
 /// remaining candidates with upper bounds on their marginal gain. Bounds
 /// computed at a node stay valid below it (gains only shrink as the set
 /// grows), so a subtree is skipped when the current score plus the best
 /// `k` remaining bounds — or the score of adding *all* remaining candidates
 /// — cannot beat the incumbent. Children are visited in decreasing bound
 /// order, so the first leaf reached is the greedy solution.
-struct SetSearch<'a> {
+///
+/// The children of a large node are explored in parallel once its first
+/// child is done (which supplies the greedy incumbent). Every set has a
+/// position in the sequential visiting order, its `path` of child indices,
+/// and a set beats the incumbent when it scores higher, or the same and comes
+/// earlier in that order. Pruning only discards sets that cannot beat it, so
+/// the outcome is the first best set in visiting order, as for a sequential
+/// search, whatever the thread count and timing. With one thread the
+/// search is sequential.
+struct Shared<'a> {
     obj: Objective,
     wt: &'a Weights,
     words: usize,
     pool: &'a [Cand],
+    best: Mutex<Incumbent>,
+    /// Bumped on every change of `best`, so workers can tell cheaply when
+    /// their copy of it is stale.
+    version: AtomicU64,
+    /// Evaluations flushed by the workers.
+    evals: AtomicU64,
+    next_report: AtomicU64,
+    /// Set when a worker hits a limit or cancellation; `error` holds the
+    /// first such message.
+    failed: AtomicBool,
+    error: Mutex<Option<String>>,
+    limits: &'a SearchLimits,
+    progress: &'a dyn Progress,
+}
+
+/// The best set found so far.
+struct Incumbent {
+    score: i64,
+    /// Position in visiting order (see [`Worker::path`]).
+    path: Vec<u32>,
+    set: Vec<usize>,
+}
+
+/// The search was aborted; the reason is in [`Shared::error`].
+struct Abort;
+
+type Step = Result<(), Abort>;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Shared<'_> {
+    fn fail(&self, message: String) -> Abort {
+        let mut error = lock(&self.error);
+        if error.is_none() {
+            *error = Some(message);
+        }
+        self.failed.store(true, Ordering::Relaxed);
+        Abort
+    }
+}
+
+/// The search state of one thread: the current set and a copy of the
+/// incumbent.
+#[derive(Clone)]
+struct Worker<'a> {
+    sh: &'a Shared<'a>,
     /// Union profile of the chosen candidates (plus injected oligos).
     state: Vec<u64>,
     /// Per-depth copies of `state` for backtracking.
     saved: Vec<Vec<u64>>,
     score: i64,
-    best: i64,
-    best_set: Vec<usize>,
     chosen: Vec<usize>,
+    /// Position of the current set in visiting order: the child index taken
+    /// at each depth. Paths compare lexicographically, a set before the sets
+    /// below it.
+    path: Vec<u32>,
+    /// Evaluations not yet flushed to [`Shared::evals`].
     evals: u64,
-    max_work: u64,
-    next_report: u64,
-    progress: &'a dyn Progress,
-    generated: u64,
-    set_size: usize,
+    /// Copy of the incumbent's score and path as of `version` `seen`.
+    seen: u64,
+    best: i64,
+    best_path: Vec<u32>,
 }
 
-impl SetSearch<'_> {
+/// The children of one node: candidates with their gain and bound, sorted
+/// by bound descending, plus the prefix sums and suffix bounds that prune
+/// them.
+struct Node {
+    fresh: Vec<(u32, i64, i64)>,
+    pairs: Vec<(u32, i64)>,
+    psum: Vec<i64>,
+    suf: Vec<i64>,
+    k: usize,
+    depth: usize,
+}
+
+impl Worker<'_> {
     /// Marginal gain of `planes` on the current set, and an upper bound on
     /// its gain on any superset (`Exact` gains can turn negative later; only
     /// newly hit, previously uncovered sequences can add).
     fn delta(&self, planes: &[u64]) -> (i64, i64) {
-        let (w, st) = (self.words, &self.state);
-        match self.obj.op {
+        let (w, st, sh) = (self.sh.words, &self.state, self.sh);
+        match sh.obj.op {
             MismatchOp::LowerOrEqual => {
                 let mut d = 0i64;
-                for j in 0..self.obj.planes {
+                for j in 0..sh.obj.planes {
                     let o = j * w;
                     let s: u64 = (0..w)
-                        .map(|i| self.wt.word(i, planes[o + i] & !st[o + i]))
+                        .map(|i| sh.wt.word(i, planes[o + i] & !st[o + i]))
                         .sum();
-                    d += self.obj.coef(j) * s as i64;
+                    d += sh.obj.coef(j) * s as i64;
                 }
                 (d, d)
             }
@@ -1627,8 +1725,8 @@ impl SetSearch<'_> {
                 let (mut gain, mut loss) = (0u64, 0u64);
                 for i in 0..w {
                     let (sx, slo) = (st[i], st[w + i]);
-                    gain += self.wt.word(i, planes[i] & !sx & !slo);
-                    loss += self.wt.word(i, planes[w + i] & sx & !slo);
+                    gain += sh.wt.word(i, planes[i] & !sx & !slo);
+                    loss += sh.wt.word(i, planes[w + i] & sx & !slo);
                 }
                 (gain as i64 - loss as i64, gain as i64)
             }
@@ -1639,27 +1737,28 @@ impl SetSearch<'_> {
     /// `list[t..]`: the score of adding all of them (`LowerOrEqual`), or the
     /// count plus every uncovered sequence some of them hit exactly (`Exact`).
     fn suffix_bounds(&self, list: &[(u32, i64, i64)]) -> Vec<i64> {
-        let w = self.words;
+        let sh = self.sh;
+        let w = sh.words;
         let mut acc = self.state.clone();
         let mut s = self.score;
         let mut suf = vec![0i64; list.len()];
         for t in (0..list.len()).rev() {
-            let o = &self.pool[list[t].0 as usize].planes;
-            match self.obj.op {
+            let o = &sh.pool[list[t].0 as usize].planes;
+            match sh.obj.op {
                 MismatchOp::LowerOrEqual => {
-                    for j in 0..self.obj.planes {
+                    for j in 0..sh.obj.planes {
                         let b = j * w;
                         let mut g = 0u64;
                         for i in 0..w {
-                            g += self.wt.word(i, o[b + i] & !acc[b + i]);
+                            g += sh.wt.word(i, o[b + i] & !acc[b + i]);
                             acc[b + i] |= o[b + i];
                         }
-                        s += self.obj.coef(j) * g as i64;
+                        s += sh.obj.coef(j) * g as i64;
                     }
                 }
                 MismatchOp::Exact => {
                     for i in 0..w {
-                        s += self.wt.word(i, o[i] & !acc[i] & !self.state[w + i]) as i64;
+                        s += sh.wt.word(i, o[i] & !acc[i] & !self.state[w + i]) as i64;
                         acc[i] |= o[i];
                     }
                 }
@@ -1669,31 +1768,52 @@ impl SetSearch<'_> {
         suf
     }
 
-    fn tick(&mut self, n: u64) -> Result<(), String> {
+    fn tick(&mut self, n: u64) -> Step {
         self.evals += n;
-        if self.max_work > 0 && self.evals > self.max_work {
-            return Err(format!(
+        if self.evals >= FLUSH_EVERY {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Add the local evaluations to the shared count, checking the work
+    /// limit, cancellation and whether to report progress.
+    fn flush(&mut self) -> Step {
+        let sh = self.sh;
+        let n = std::mem::take(&mut self.evals);
+        let total = sh.evals.fetch_add(n, Ordering::Relaxed) + n;
+        if sh.failed.load(Ordering::Relaxed) {
+            return Err(Abort);
+        }
+        let limits = sh.limits;
+        if limits.max_work > 0 && total > limits.max_work {
+            return Err(sh.fail(format!(
                 "the set search exceeded the work limit of {} evaluations (--max-work; \
                  0 = no limit) before the best set could be proven. Pool: {} candidate \
                  oligos after reduction ({} generated), set size {}. Reduce --n-oligos, \
                  --mismatches or --ambiguities, narrow the search with --fixed, or raise \
                  --max-work.",
-                self.max_work,
-                self.pool.len(),
-                self.generated,
-                self.set_size
-            ));
+                limits.max_work,
+                sh.pool.len(),
+                limits.generated,
+                limits.set_size
+            )));
         }
-        if self.evals >= self.next_report {
-            self.next_report = self.evals + REPORT_EVERY;
-            if self.progress.cancelled() {
-                return Err("search cancelled".to_string());
+        let due = sh.next_report.load(Ordering::Relaxed);
+        if total >= due
+            && sh
+                .next_report
+                .compare_exchange(due, total + REPORT_EVERY, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            if sh.progress.cancelled() {
+                return Err(sh.fail("search cancelled".to_string()));
             }
-            self.progress.report(
+            sh.progress.report(
                 &format!(
                     "Optimize by mismatch: searching sets over {} candidates ({} evaluations)",
-                    self.pool.len(),
-                    self.evals
+                    sh.pool.len(),
+                    total
                 ),
                 70.0,
             );
@@ -1701,27 +1821,70 @@ impl SetSearch<'_> {
         Ok(())
     }
 
-    fn record(&mut self, extra: Option<usize>) {
-        self.best_set.clear();
-        self.best_set.extend_from_slice(&self.chosen);
-        self.best_set.extend(extra);
+    /// Bring the copy of the incumbent up to date.
+    fn refresh(&mut self) {
+        if self.sh.version.load(Ordering::Acquire) != self.seen {
+            let best = lock(&self.sh.best);
+            self.best = best.score;
+            self.best_path.clone_from(&best.path);
+            self.seen = self.sh.version.load(Ordering::Relaxed);
+        }
+    }
+
+    /// Whether no set of a region can beat the incumbent, where every set in
+    /// the region scores at most `bound` and the region's first set in
+    /// visiting order is child `next` of the current set.
+    fn cannot_beat(&mut self, bound: i64, next: u32) -> bool {
+        self.refresh();
+        bound < self.best
+            || (bound == self.best
+                && self
+                    .best_path
+                    .iter()
+                    .cmp(self.path.iter().chain(std::iter::once(&next)))
+                    .is_lt())
+    }
+
+    /// Make the current set, extended by the `leaf` (child index, pool
+    /// index) if given, the incumbent when it scores `score` and beats it.
+    fn offer(&mut self, score: i64, leaf: Option<(u32, usize)>) {
+        let at = leaf.map(|l| l.0);
+        let path = &self.path;
+        let beats = |best: i64, best_path: &[u32]| {
+            score > best
+                || (score == best && path.iter().chain(at.iter()).cmp(best_path.iter()).is_lt())
+        };
+        if !beats(self.best, &self.best_path) {
+            return;
+        }
+        let sh = self.sh;
+        let mut best = lock(&sh.best);
+        if beats(best.score, &best.path) {
+            best.score = score;
+            best.path.clear();
+            best.path.extend(path.iter().chain(at.iter()));
+            best.set.clear();
+            best.set.extend(self.chosen.iter().copied().chain(leaf.map(|l| l.1)));
+            sh.version.fetch_add(1, Ordering::Release);
+        }
+        self.best = best.score;
+        self.best_path.clone_from(&best.path);
+        self.seen = sh.version.load(Ordering::Relaxed);
     }
 
     /// Explore every way of adding up to `k` candidates from `list` (sorted
     /// by bound descending, then pool index), each with an upper bound on its
     /// gain on the current set.
-    fn dfs(&mut self, list: &[(u32, i64)], k: usize, depth: usize) -> Result<(), String> {
+    fn dfs(&mut self, list: &[(u32, i64)], k: usize, depth: usize) -> Step {
+        let pool = self.sh.pool;
         if k == 1 {
-            for &(i, bound) in list {
-                if self.score + bound <= self.best {
+            for (u, &(i, bound)) in list.iter().enumerate() {
+                if self.cannot_beat(self.score + bound, u as u32) {
                     break;
                 }
-                let (d, _) = self.delta(&self.pool[i as usize].planes);
+                let (d, _) = self.delta(&pool[i as usize].planes);
                 self.tick(1)?;
-                if self.score + d > self.best {
-                    self.best = self.score + d;
-                    self.record(Some(i as usize));
-                }
+                self.offer(self.score + d, Some((u as u32, i as usize)));
             }
             return Ok(());
         }
@@ -1729,7 +1892,7 @@ impl SetSearch<'_> {
         let fresh: Vec<(u32, i64, i64)> = {
             let this = &*self;
             let eval = |&(i, _): &(u32, i64)| {
-                let (d, b) = this.delta(&this.pool[i as usize].planes);
+                let (d, b) = this.delta(&pool[i as usize].planes);
                 (i, d, b)
             };
             if list.len() >= PAR_MIN_ITEMS {
@@ -1752,36 +1915,86 @@ impl SetSearch<'_> {
         let suf = self.suffix_bounds(&fresh);
         self.tick(len as u64)?;
         let pairs: Vec<(u32, i64)> = fresh.iter().map(|&(i, _, b)| (i, b)).collect();
+        let node = Node {
+            fresh,
+            pairs,
+            psum,
+            suf,
+            k,
+            depth,
+        };
 
-        for t in 0..len {
-            let top = psum[(t + k).min(len)] - psum[t];
-            if (self.score + top).min(suf[t]) <= self.best {
-                break;
-            }
-            let (i, d, _) = fresh[t];
-            self.saved[depth].copy_from_slice(&self.state);
-            let saved_score = self.score;
-            for (s, o) in self.state.iter_mut().zip(self.pool[i as usize].planes.iter()) {
-                *s |= o;
-            }
-            self.score += d;
-            self.chosen.push(i as usize);
-            if self.score > self.best {
-                self.best = self.score;
-                self.record(None);
-            }
-            let rest = &pairs[t + 1..];
-            if !rest.is_empty() {
-                let child_top = psum[(t + k).min(len)] - psum[t + 1];
-                if (self.score + child_top).min(suf[t]) > self.best {
-                    self.dfs(rest, k - 1, depth + 1)?;
+        let threads = rayon::current_num_threads();
+        if len < PAR_MIN_CHILDREN || threads == 1 {
+            for t in 0..len {
+                if !self.child(&node, t)? {
+                    break;
                 }
             }
-            self.chosen.pop();
-            self.state.copy_from_slice(&self.saved[depth]);
-            self.score = saved_score;
+            return Ok(());
         }
-        Ok(())
+        // The first child leads to the greedy set: explore it before its
+        // siblings start, so they prune against a strong incumbent.
+        if !self.child(&node, 0)? {
+            return Ok(());
+        }
+        let next = AtomicUsize::new(1);
+        let stop = AtomicBool::new(false);
+        let parent = &*self;
+        (0..threads.min(len - 1)).into_par_iter().try_for_each(|_| {
+            let mut worker: Option<Worker> = None;
+            while !stop.load(Ordering::Relaxed) {
+                let t = next.fetch_add(1, Ordering::Relaxed);
+                if t >= len {
+                    break;
+                }
+                let w = worker.get_or_insert_with(|| Worker {
+                    evals: 0,
+                    ..parent.clone()
+                });
+                if !w.child(&node, t)? {
+                    // Later children have lower bounds and come later.
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            match worker {
+                Some(mut w) => w.flush(),
+                None => Ok(()),
+            }
+        })
+    }
+
+    /// Visit child `t` of `node` and the sets below it. `false` when it
+    /// cannot beat the incumbent, and so neither can any later child.
+    fn child(&mut self, node: &Node, t: usize) -> Result<bool, Abort> {
+        let (len, k, depth) = (node.fresh.len(), node.k, node.depth);
+        let top = node.psum[(t + k).min(len)] - node.psum[t];
+        if self.cannot_beat((self.score + top).min(node.suf[t]), t as u32) {
+            return Ok(false);
+        }
+        let (i, d, _) = node.fresh[t];
+        self.saved[depth].copy_from_slice(&self.state);
+        let saved_score = self.score;
+        for (s, o) in self.state.iter_mut().zip(self.sh.pool[i as usize].planes.iter()) {
+            *s |= o;
+        }
+        self.score += d;
+        self.chosen.push(i as usize);
+        self.path.push(t as u32);
+        self.offer(self.score, None);
+        let rest = &node.pairs[t + 1..];
+        if !rest.is_empty() {
+            let child_top = node.psum[(t + k).min(len)] - node.psum[t + 1];
+            // The sets below this one start at its first child.
+            if !self.cannot_beat((self.score + child_top).min(node.suf[t]), 0) {
+                self.dfs(rest, k - 1, depth + 1)?;
+            }
+        }
+        self.path.pop();
+        self.chosen.pop();
+        self.state.copy_from_slice(&self.saved[depth]);
+        self.score = saved_score;
+        Ok(true)
     }
 }
 
@@ -2290,6 +2503,51 @@ mod tests {
             assert_eq!(best, want, "case {case}: op={op:?} x={x} slots={slots} pool={size}");
             assert_eq!(score_of(&set), best, "case {case}: reported set reaches the score");
             assert!(set.len() <= slots);
+        }
+    }
+
+    /// Parallel exploration picks the same set as the sequential search,
+    /// including which of several equally good sets, on pools with many
+    /// ties and large enough to be explored in parallel.
+    #[test]
+    fn set_search_independent_of_threads() {
+        let mut rng = Lcg(31);
+        let threads = |n| rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap();
+        let (one, many) = (threads(1), threads(8));
+        for case in 0..24 {
+            let op = if case % 2 == 0 { MismatchOp::LowerOrEqual } else { MismatchOp::Exact };
+            let x = rng.below(3) as usize;
+            let elems = 30 + rng.below(60) as usize;
+            let words = words_for(elems);
+            let weights: Vec<u64> = (0..elems).map(|_| 1 + rng.below(2)).collect();
+            let wt = Weights::new(&weights);
+            let obj = Objective::new(op, x, weights.iter().sum());
+            let slots = 2 + rng.below(2) as usize;
+            let size = if slots == 2 { 150 + rng.below(250) } else { 60 + rng.below(90) } as usize;
+            let mut pool: Vec<Cand> = (0..size)
+                .map(|i| {
+                    let lv = random_planes(&mut rng, obj, elems);
+                    dummy_cand(i as u32, planes_of(&lv, obj, words), obj, words, &wt)
+                })
+                .collect();
+            pool.sort_by(|a, b| b.score.cmp(&a.score).then(a.sec.cmp(&b.sec)).then(a.key.cmp(&b.key)));
+            let state = if case % 3 == 0 {
+                planes_of(&random_planes(&mut rng, obj, elems), obj, words)
+            } else {
+                vec![0u64; obj.planes * words]
+            };
+            let limits = SearchLimits { max_work: 0, generated: 0, set_size: slots };
+            let run = |tp: &rayon::ThreadPool| {
+                let (best, set, _) = tp.install(|| {
+                    search_sets(obj, &wt, words, &pool, state.clone(), slots, &limits, &NoProgress)
+                        .unwrap()
+                });
+                (best, set)
+            };
+            let want = run(&one);
+            for _ in 0..3 {
+                assert_eq!(run(&many), want, "case {case}: op={op:?} x={x} slots={slots} pool={size}");
+            }
         }
     }
 

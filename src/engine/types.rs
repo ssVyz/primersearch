@@ -79,7 +79,8 @@ pub struct MismatchReport {
     pub candidates_generated: u64,
     /// Candidates left after dropping duplicates and dominated ones.
     pub candidates_reduced: usize,
-    /// Candidate evaluations spent in the set search.
+    /// Candidate evaluations spent in the set search. With several threads
+    /// it can vary slightly from run to run; the chosen set does not.
     pub evaluations: u64,
 }
 
