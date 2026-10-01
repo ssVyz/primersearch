@@ -26,7 +26,8 @@ use rayon::prelude::*;
 use crate::engine::iupac::{base_mask, complement_mask, is_ambiguous, mask_to_iupac, reverse_complement};
 use crate::engine::tm::{calculate_tm, determine_oligo_length, TmParams};
 use crate::engine::types::{
-    Orientation, PrimerCandidate, PrimerSearchResult, Progress, SearchMode, SearchSettings,
+    MismatchSettings, Orientation, PrimerCandidate, PrimerSearchResult, Progress, SearchMode,
+    SearchSettings,
 };
 
 // ---------------------------------------------------------------------------
@@ -476,14 +477,14 @@ fn apply_injected_oligos(
 ///
 /// An empty set never excludes anything, so a run without `--exclude` produces
 /// byte-for-byte identical results to before this feature existed.
-struct ExcludeSet {
+pub(crate) struct ExcludeSet {
     /// One entry per excluded primer: its IUPAC bit-masks in 3'→5' order
     /// (index 0 = the 3'-most base) — i.e. the display sequence, reversed.
     sigs: Vec<Vec<u8>>,
 }
 
 impl ExcludeSet {
-    fn new(excluded: &[Vec<u8>]) -> Self {
+    pub(crate) fn new(excluded: &[Vec<u8>]) -> Self {
         let sigs = excluded
             .iter()
             .map(|e| e.iter().rev().map(|&b| base_mask(b)).collect())
@@ -497,7 +498,7 @@ impl ExcludeSet {
     /// complement, so the display's k-th base from the 3' end is the base-
     /// complement of `forward[k]`. Computed without allocating a reverse
     /// complement per candidate.
-    fn excludes(&self, forward: &[u8], is_reverse: bool) -> bool {
+    pub(crate) fn excludes(&self, forward: &[u8], is_reverse: bool) -> bool {
         if self.sigs.is_empty() {
             return false;
         }
@@ -568,6 +569,9 @@ fn evaluate_range(
             tm_params,
             exclude_set,
         )?,
+        SearchMode::OptimizeByMismatch => {
+            unreachable!("optimize-by-mismatch is handled by find_primers_by_mismatch")
+        }
     };
 
     // Tm of the actual displayed primer (the consensus / chosen variant).
@@ -963,6 +967,7 @@ mod tests {
             three_prime_match: 0,
             max_seeds: 0,
             fixed: true,
+            mismatch: MismatchSettings::default(),
         }
     }
 
@@ -1123,6 +1128,7 @@ mod tests {
             three_prime_match: 0,
             max_seeds: 0,
             fixed: false,
+            mismatch: MismatchSettings::default(),
         }
     }
 

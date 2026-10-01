@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use serde::Serialize;
 
 use crate::engine::{
-    Orientation, PrimerSearchResult, QualityReport, SearchMode, SearchSettings,
+    MismatchOp, Orientation, PrimerSearchResult, QualityReport, SearchMode, SearchSettings,
 };
 
 /// Bump this when the JSON shape changes in a backward-incompatible way so
@@ -45,7 +45,7 @@ struct Removed {
 
 #[derive(Serialize)]
 struct Settings {
-    /// `"no_ambiguities"` or `"incremental"`.
+    /// `"no_ambiguities"`, `"incremental"` or `"optimize_by_mismatch"`.
     mode: &'static str,
     fixed: bool,
     /// `"forward"` or `"reverse"`.
@@ -64,6 +64,21 @@ struct Settings {
     only_twofold: bool,
     three_prime_match: usize,
     max_seeds: usize,
+    /// Present only in `optimize_by_mismatch` mode, so documents of the other
+    /// modes are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", flatten)]
+    mismatch: Option<MismatchSettingsDto>,
+}
+
+#[derive(Serialize)]
+struct MismatchSettingsDto {
+    /// `"lower_or_equal"` or `"exact"`.
+    mismatch_mode: &'static str,
+    n_oligos: usize,
+    mismatches: usize,
+    ambiguities: usize,
+    max_candidates: u64,
+    max_work: u64,
 }
 
 #[derive(Serialize)]
@@ -73,6 +88,36 @@ struct ResultBlock<'a> {
     injected_count: usize,
     message: &'a str,
     primers: Vec<Primer>,
+    /// Present only in `optimize_by_mismatch` mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mismatch_breakdown: Option<Breakdown>,
+}
+
+/// Set-level coverage of an `optimize_by_mismatch` run: every sequence is
+/// scored by its best-matching oligo in the set.
+#[derive(Serialize)]
+struct Breakdown {
+    /// Sequences meeting the coverage criterion (sum of the primers'
+    /// `coverage_count`).
+    counted: usize,
+    counted_pct: f64,
+    /// One entry per mismatch count `0..=mismatches`.
+    levels: Vec<Level>,
+    /// More than `mismatches` mismatches to every oligo, or a mismatch in the
+    /// protected 3' region.
+    not_covered: usize,
+    not_covered_pct: f64,
+    windows: usize,
+    candidates_generated: u64,
+    candidates_after_reduction: usize,
+    evaluations: u64,
+}
+
+#[derive(Serialize)]
+struct Level {
+    mismatches: usize,
+    count: usize,
+    pct: f64,
 }
 
 #[derive(Serialize)]
@@ -158,6 +203,7 @@ pub fn write_json<W: Write>(
             mode: match settings.mode {
                 SearchMode::NoAmbiguities => "no_ambiguities",
                 SearchMode::Incremental => "incremental",
+                SearchMode::OptimizeByMismatch => "optimize_by_mismatch",
             },
             fixed: settings.fixed,
             orientation: match settings.orientation {
@@ -176,6 +222,20 @@ pub fn write_json<W: Write>(
             only_twofold: settings.only_twofold,
             three_prime_match: settings.three_prime_match,
             max_seeds: settings.max_seeds,
+            mismatch: matches!(settings.mode, SearchMode::OptimizeByMismatch).then(|| {
+                let m = &settings.mismatch;
+                MismatchSettingsDto {
+                    mismatch_mode: match m.op {
+                        MismatchOp::LowerOrEqual => "lower_or_equal",
+                        MismatchOp::Exact => "exact",
+                    },
+                    n_oligos: m.oligo_count,
+                    mismatches: m.mismatches,
+                    ambiguities: m.ambiguities,
+                    max_candidates: m.max_candidates,
+                    max_work: m.max_work,
+                }
+            }),
         },
         result: ResultBlock {
             total_sequences: result.total_sequences,
@@ -183,6 +243,35 @@ pub fn write_json<W: Write>(
             injected_count,
             message: &result.message,
             primers,
+            mismatch_breakdown: result.mismatch.as_ref().map(|r| {
+                let pct = |c: usize| {
+                    if result.total_sequences == 0 {
+                        0.0
+                    } else {
+                        c as f64 / result.total_sequences as f64 * 100.0
+                    }
+                };
+                Breakdown {
+                    counted: r.counted,
+                    counted_pct: pct(r.counted),
+                    levels: r
+                        .level_counts
+                        .iter()
+                        .enumerate()
+                        .map(|(j, &c)| Level {
+                            mismatches: j,
+                            count: c,
+                            pct: pct(c),
+                        })
+                        .collect(),
+                    not_covered: r.not_covered,
+                    not_covered_pct: pct(r.not_covered),
+                    windows: r.windows,
+                    candidates_generated: r.candidates_generated,
+                    candidates_after_reduction: r.candidates_reduced,
+                    evaluations: r.evaluations,
+                }
+            }),
         },
     };
 

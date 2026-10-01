@@ -11,15 +11,18 @@
 
 mod fasta;
 mod iupac;
+mod mismatch;
 mod search;
 pub mod tm;
 mod types;
 
 pub use fasta::{parse_fasta, quality_filter};
 pub use iupac::{base_mask, is_ambiguous, reverse_complement};
+pub use mismatch::find_primers_by_mismatch;
 pub use search::{find_primers, find_primers_fixed};
 pub use tm::{calculate_tm, determine_oligo_length, TmParams};
 pub use types::{
-    NoProgress, Orientation, PrimerCandidate, PrimerSearchResult, Progress, QualityReport,
-    SearchMode, SearchSettings,
+    MismatchOp, MismatchReport, MismatchSettings, NoProgress, Orientation, PrimerCandidate,
+    PrimerSearchResult, Progress, QualityReport, SearchMode, SearchSettings,
+    DEFAULT_MAX_CANDIDATES, DEFAULT_MAX_WORK,
 };

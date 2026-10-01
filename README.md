@@ -14,12 +14,18 @@ sequence. Each round, it picks the primer that covers the largest number
 of *remaining* sequences, removes those, and repeats until coverage is
 100%.
 
-Two search modes:
+Two greedy search modes:
 
 - **`no-ambiguities`** — exact-match primers only.
 - **`incremental`** — allow IUPAC ambiguity codes (R, Y, …, up to a
   user-set budget) to absorb closely-related variants into one primer.
   Falls back to exact-match if no ambiguity expansion qualifies.
+
+And one exhaustive mode:
+
+- **`optimize-by-mismatch`** — the best set of (at most) `n` oligos, each
+  with a given number of ambiguity codes, when sequences may be bound with
+  mismatches. See "Optimize-by-mismatch mode" below.
 
 There is also a **fixed-slice** mode (`--fixed`) for when you already know
 *where* the primer should sit. See "Fixed-slice mode" below.
@@ -60,6 +66,7 @@ primersearch input.fasta --tm 62 --na 200 --mode incremental --target 60 --max-a
 primersearch slice.fasta --fixed --mode incremental --max-amb 3   # generate variants for a fixed slice
 primersearch input.fasta --inject ACGTTGCACGTACGTACGT   # force one or more obligatory oligos
 primersearch input.fasta --exclude CTAAATCYCGTG          # forbid candidates matching a 3' signature
+primersearch input.fasta --mode optimize-by-mismatch --n-oligos 3 --mismatches 1 --ambiguities 2
 primersearch --mkini                 # write defaults to settings.ini
 primersearch input.fasta -j 8        # 8 worker threads
 primersearch input.fasta --silent    # no progress / info output
@@ -182,6 +189,93 @@ Details:
   `--exclude` with `--fixed` prints a warning.
 - Running without `--exclude` produces exactly the same results as before the
   feature existed — the check is skipped entirely when no signatures are given.
+- In `optimize-by-mismatch` mode exclusion also applies with `--fixed` (see
+  below).
+
+### Optimize-by-mismatch mode
+
+`--mode optimize-by-mismatch` replaces the greedy round loop with an exhaustive
+search for the **best set of `n` oligos** (`--n-oligos`), where each oligo
+carries exactly `y` IUPAC ambiguity codes (`--ambiguities`) and sequences may
+be bound with mismatches (`--mismatches`). It never lists more than `n`
+oligos, even if sequences remain uncovered.
+
+```
+primersearch input.fasta --mode optimize-by-mismatch --n-oligos 3 --mismatches 1 --ambiguities 2
+primersearch slice.fasta --fixed --mode optimize-by-mismatch --n-oligos 2 --mismatches 1 --mismatch-mode exact
+```
+
+Every sequence is scored by its **best-matching oligo** in the set (fewest
+mismatches). The coverage criterion is chosen with `--mismatch-mode`:
+
+- `lower-or-equal` (default) — a sequence counts when its best match has at
+  most `--mismatches` mismatches. Among sets with equal coverage, the one with
+  the fewest total mismatches over the covered sequences wins.
+- `exact` — a sequence counts only when its best match has *exactly*
+  `--mismatches` mismatches; sequences matched better than that do not count.
+
+Where the candidates come from:
+
+- With `--fixed` the whole alignment is one slice. Its IUPAC consensus is
+  deconstructed into variants: `y` of the variable positions keep their
+  consensus code and every other variable position is resolved to one of the
+  bases observed there (exactly `y` codes, or fewer when the slice has fewer
+  variable positions). The Tm threshold is not enforced.
+- Otherwise the windows are the same Tm-derived ranges the regular search
+  uses (from every start position of every sequence, the shortest length
+  reaching `--tm`), each deconstructed the same way, and every candidate's own
+  Tm (median over its variants) must reach `--tm`. Candidates from all
+  windows compete, so the oligos of a set may sit at different positions.
+
+A variant more than `--mismatches` away from every input sequence can never
+cover anything, so those are skipped. The result is the same as enumerating
+every variant.
+
+How the other options apply:
+
+- `--three-prime N` — no ambiguity codes in the 3'-most `N` bases, **and** a
+  sequence with a mismatch in those bases counts as not covered.
+- `--exclude-n` / `--only-twofold` — where the consensus code at a position is
+  forbidden, the widest allowed sub-codes are used instead.
+- `--exclude` — candidates matching an excluded 3' signature are dropped, in
+  this mode also with `--fixed` (it chooses among candidates rather than
+  having to cover every sequence).
+- `--inject` — injected oligos are fixed members of the set and **count
+  toward `--n-oligos`**. Each is placed where it alone scores best, under the
+  same mismatch rules.
+- `--target`, `--max-amb` and `--max-seeds` are not used.
+
+Output: the table lists the set, injected oligos first, then by decreasing
+Count. Each counted sequence is credited to its best-matching oligo (ties to
+the one listed first), so Total% adds up to the set's coverage. A mismatch
+breakdown follows the table: how many sequences the set binds with 0, 1, …
+mismatches, and how many it does not cover. If further oligos cannot improve
+the result, fewer than `n` are listed and a note says so.
+
+#### Search space and limits
+
+The reported set is optimal for the criterion, which makes the method
+exponential in the worst case. Candidates with an identical coverage profile,
+or that another candidate matches at least as well on every sequence, are
+dropped first (this cannot change the optimum), and sets are searched with
+branch-and-bound. Two limits keep runs bounded; exceeding either aborts with
+an error explaining how to shrink the problem, and no partial result is
+reported:
+
+- `--max-candidates N` (default 500,000,000) — candidate variants that would
+  be enumerated, estimated before any work starts.
+- `--max-work N` (default 2,000,000,000) — candidate evaluations in the set
+  search.
+
+`0` disables a limit. The largest allocations are checked, so running out of
+memory normally ends with an error message rather than a crash. The biggest
+levers are `--mismatches` and `--ambiguities` (number of candidates), then
+`--n-oligos` (set search); `--fixed` on a narrow slice is far cheaper than
+searching the whole alignment, which pools candidates from every window.
+
+The mode can be selected in `settings.ini` (`search_mode =
+"optimize_by_mismatch"`); its parameters are CLI-only (defaults: 1 oligo,
+0 mismatches, 0 ambiguities, `lower-or-equal`).
 
 ### Settings precedence
 
@@ -203,15 +297,20 @@ defaults file, or pass `--config <path>` to point at an alternative.
 | `--na MM` | Na⁺ concentration in mM |
 | `--mg MM` | Mg²⁺ concentration in mM |
 | `--dntp MM` | dNTP concentration in mM (one Mg²⁺ sequestered per dNTP) |
-| `--mode {no-ambiguities,incremental}` | Variant-generation mode |
+| `--mode {no-ambiguities,incremental,optimize-by-mismatch}` | Variant-generation mode |
 | `--fixed` | Skip the search; treat the whole input as one slice and generate the variants needed to cover it (Tm threshold not enforced) |
 | `--target PCT` | Coverage target % at which the ambiguity counter is allowed to increase (incremental) |
 | `--max-amb N` | Maximum ambiguity codes per primer (incremental) |
 | `--exclude-n` / `--only-twofold` | IUPAC restrictions (incremental) |
 | `--three-prime N` | Number of 3' bases that must be perfectly conserved |
 | `--inject OLIGO` | Obligatory oligo placed before the search (repeatable / comma-separated). See "Injecting obligatory oligos" |
-| `--exclude OLIGO` | Primer whose 3' signature must not be reproduced by the search (repeatable / comma-separated; ignored in `--fixed`). See "Excluding primers by 3' signature" |
+| `--exclude OLIGO` | Primer whose 3' signature must not be reproduced by the search (repeatable / comma-separated; ignored in `--fixed` except in optimize-by-mismatch). See "Excluding primers by 3' signature" |
 | `--max-seeds N` | Per-range seed cap in incremental mode (0 = no cap, default 50) |
+| `--n-oligos N` | Oligos in the optimized set (optimize-by-mismatch; injected oligos count toward it) |
+| `--mismatches X` | Mismatch count of the coverage criterion (optimize-by-mismatch) |
+| `--ambiguities Y` | Ambiguity codes per oligo (optimize-by-mismatch) |
+| `--mismatch-mode {lower-or-equal,exact}` | Count sequences matched with at most / exactly `X` mismatches (optimize-by-mismatch) |
+| `--max-candidates N` / `--max-work N` | Search-space limits of optimize-by-mismatch (0 = no limit) |
 | `-j, --threads N` | Worker threads (0 = all logical cores) |
 | `-s, --silent` | Suppress progress / info |
 | `--mkini` | Write a default `settings.ini` and exit |
@@ -272,6 +371,16 @@ The JSON document (`format_version: 1`) has three top-level objects:
   half-open range `align_start` / `align_end`, and a 1-based
   `position_label` (e.g. `"9-20"`) matching the text output.
 
+In `optimize-by-mismatch` mode, `settings` also carries `mismatch_mode`
+(`"lower_or_equal"` / `"exact"`), `n_oligos`, `mismatches`, `ambiguities`,
+`max_candidates` and `max_work`, and `result` carries `mismatch_breakdown`:
+`counted` / `counted_pct` (sequences meeting the criterion), `levels` (one
+`{mismatches, count, pct}` entry per mismatch count `0..=mismatches`, each
+sequence scored by its best-matching oligo), `not_covered` /
+`not_covered_pct`, and the search statistics `windows`,
+`candidates_generated`, `candidates_after_reduction` and `evaluations`. These
+keys are absent in the other modes, whose documents are unchanged.
+
 Bump-guard on `format_version` before parsing; it increments only on a
 backward-incompatible shape change.
 
@@ -310,6 +419,21 @@ Fixed-slice mode (`--fixed`) reuses the same round loop and the same
 per-range evaluators, but skips phase 1 (range discovery) and phase 2's
 parallelism: there is exactly one range — the whole slice `[0, len)` — so
 each round evaluates just that, with the Tm threshold disabled as a gate.
+
+Optimize-by-mismatch (`src/engine/mismatch.rs`) does not use the round loop:
+
+```
+windows: the fixed slice, or phase-1 ranges over all sequences
+per window (parallel): enumerate consensus variants within reach of
+    some slice, compute each one's coverage profile (mismatch level per
+    sequence, as bitsets), keep only valid, non-dominated candidates
+pool: merge the windows' candidates, again keeping non-dominated ones
+branch-and-bound over sets of up to n pool candidates
+```
+
+Results are identical across thread counts: the reduced pool does not depend
+on processing order, and the set search visits sets in a fixed order and
+keeps the first strictly best one.
 
 ## Tm calculation
 
@@ -350,6 +474,8 @@ src/
     fasta.rs         FASTA parser + quality filter
     tm.rs            nearest-neighbor thermodynamic Tm
     search.rs        greedy round loop, per-range evaluators
+    mismatch.rs      optimize-by-mismatch: candidate enumeration,
+                     dominance reduction, branch-and-bound set search
 example_sets/      reference inputs and Python-tool outputs for testing
 reference_program/ original Python implementation (kept for reference)
 program_instructions.md  initial spec / Q&A

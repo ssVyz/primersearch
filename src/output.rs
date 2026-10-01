@@ -4,7 +4,10 @@
 
 use std::io::Write;
 
-use crate::engine::{Orientation, PrimerSearchResult, QualityReport, SearchMode, SearchSettings};
+use crate::engine::{
+    MismatchOp, MismatchReport, Orientation, PrimerSearchResult, QualityReport, SearchMode,
+    SearchSettings,
+};
 
 pub fn format_quality_report<W: Write>(r: &QualityReport, w: &mut W) -> std::io::Result<()> {
     writeln!(w, "PRIMER SEARCH PREPROCESSING")?;
@@ -68,7 +71,19 @@ pub fn format_results<W: Write>(
             "Incremental (target {:.0}%, max {} ambiguities)",
             settings.target_coverage_pct, settings.max_ambiguities,
         ),
+        SearchMode::OptimizeByMismatch => {
+            let m = &settings.mismatch;
+            format!(
+                "Optimize by mismatch ({} oligo{}, {}, {} ambiguit{})",
+                m.oligo_count,
+                if m.oligo_count == 1 { "" } else { "s" },
+                criterion_label(settings),
+                m.ambiguities,
+                if m.ambiguities == 1 { "y" } else { "ies" },
+            )
+        }
     };
+    let by_mismatch = matches!(settings.mode, SearchMode::OptimizeByMismatch);
     let orient_label = match settings.orientation {
         Orientation::Forward => "Forward (sense)",
         Orientation::Reverse => "Reverse (anti-sense)",
@@ -92,6 +107,15 @@ pub fn format_results<W: Write>(
             injected_count
         )?;
     }
+    if let (true, Some(rep)) = (by_mismatch, &result.mismatch) {
+        writeln!(
+            w,
+            "Coverage:         {:.1}% ({} sequences, best match with {})",
+            pct_of(rep.counted, result.total_sequences),
+            thousands(rep.counted),
+            criterion_label(settings),
+        )?;
+    }
     if settings.fixed {
         writeln!(
             w,
@@ -106,15 +130,34 @@ pub fn format_results<W: Write>(
     writeln!(w, "Mg2+ Conc:        {:.2} mM", settings.mg_concentration_mm)?;
     writeln!(w, "dNTP Conc:        {:.2} mM", settings.dntp_concentration_mm)?;
     if settings.three_prime_match > 0 {
-        writeln!(w, "3' Perfect Match: {} bases", settings.three_prime_match)?;
+        if by_mismatch {
+            writeln!(
+                w,
+                "3' Perfect Match: {} bases (no ambiguities or mismatches)",
+                settings.three_prime_match
+            )?;
+        } else {
+            writeln!(w, "3' Perfect Match: {} bases", settings.three_prime_match)?;
+        }
     }
-    if matches!(settings.mode, SearchMode::Incremental) {
+    if matches!(settings.mode, SearchMode::Incremental | SearchMode::OptimizeByMismatch) {
         if settings.exclude_n {
             writeln!(w, "Exclude N:        Yes")?;
         }
         if settings.only_twofold {
             writeln!(w, "Only 2-fold:      Yes")?;
         }
+    }
+    if let (true, Some(rep)) = (by_mismatch, &result.mismatch) {
+        writeln!(
+            w,
+            "Candidates:       {} generated in {} window{}, {} after reduction, {} evaluations",
+            thousands(rep.candidates_generated as usize),
+            thousands(rep.windows),
+            if rep.windows == 1 { "" } else { "s" },
+            thousands(rep.candidates_reduced),
+            thousands(rep.evaluations as usize),
+        )?;
     }
     if !result.message.is_empty() {
         writeln!(w, "Note:             {}", result.message)?;
@@ -197,7 +240,93 @@ pub fn format_results<W: Write>(
     }
 
     writeln!(w)?;
+    if let (true, Some(rep)) = (by_mismatch, &result.mismatch) {
+        format_mismatch_breakdown(rep, settings, result.total_sequences, w)?;
+        writeln!(w)?;
+    }
     writeln!(w, "{bar}")?;
+    Ok(())
+}
+
+/// e.g. "up to 1 mismatch" / "exactly 2 mismatches".
+fn criterion_label(settings: &SearchSettings) -> String {
+    let m = &settings.mismatch;
+    format!(
+        "{} {} mismatch{}",
+        match m.op {
+            MismatchOp::LowerOrEqual => "up to",
+            MismatchOp::Exact => "exactly",
+        },
+        m.mismatches,
+        if m.mismatches == 1 { "" } else { "es" },
+    )
+}
+
+fn pct_of(count: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f64 / total as f64 * 100.0
+    }
+}
+
+/// Set-level table: how many sequences the best-matching oligo of the set
+/// binds with 0, 1, … mismatches, and how many it does not cover.
+fn format_mismatch_breakdown<W: Write>(
+    rep: &MismatchReport,
+    settings: &SearchSettings,
+    total: usize,
+    w: &mut W,
+) -> std::io::Result<()> {
+    let count_w = rep
+        .level_counts
+        .iter()
+        .chain(std::iter::once(&rep.not_covered))
+        .map(|&c| thousands(c).len())
+        .max()
+        .unwrap_or(0)
+        .max("Count".len());
+    writeln!(
+        w,
+        "Mismatch breakdown (each sequence scored by its best-matching oligo):"
+    )?;
+    writeln!(
+        w,
+        "  {:<11}   {:>cw$}   {:>6}   {:>7}",
+        "Mismatches",
+        "Count",
+        "%",
+        "Total%",
+        cw = count_w
+    )?;
+    let exact = matches!(settings.mismatch.op, MismatchOp::Exact);
+    let mut cumulative = 0.0_f64;
+    for (j, &c) in rep.level_counts.iter().enumerate() {
+        cumulative += pct_of(c, total);
+        let mark = if exact && j == settings.mismatch.mismatches {
+            "   <- counted"
+        } else {
+            ""
+        };
+        writeln!(
+            w,
+            "  {:<11}   {:>cw$}   {:>6}   {:>7}{}",
+            j,
+            thousands(c),
+            format!("{:.1}%", pct_of(c, total)),
+            format!("{:.1}%", cumulative),
+            mark,
+            cw = count_w
+        )?;
+    }
+    writeln!(
+        w,
+        "  {:<11}   {:>cw$}   {:>6}",
+        "Not covered",
+        thousands(rep.not_covered),
+        format!("{:.1}%", pct_of(rep.not_covered, total)),
+        cw = count_w
+    )?;
     Ok(())
 }
 

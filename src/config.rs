@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{Orientation, SearchMode, SearchSettings};
+use crate::engine::{MismatchSettings, Orientation, SearchMode, SearchSettings};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
@@ -49,6 +49,7 @@ fn default_dntp_concentration_mm() -> f64 {
 pub enum ConfigSearchMode {
     NoAmbiguities,
     Incremental,
+    OptimizeByMismatch,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -84,6 +85,7 @@ impl From<ConfigSearchMode> for SearchMode {
         match m {
             ConfigSearchMode::NoAmbiguities => SearchMode::NoAmbiguities,
             ConfigSearchMode::Incremental => SearchMode::Incremental,
+            ConfigSearchMode::OptimizeByMismatch => SearchMode::OptimizeByMismatch,
         }
     }
 }
@@ -116,6 +118,9 @@ impl ConfigFile {
             // Fixed mode is a per-invocation analysis choice, not a persisted
             // default; it is only ever turned on by the `--fixed` CLI flag.
             fixed: false,
+            // Optimize-by-mismatch parameters are CLI-only (not persisted), so
+            // the settings file format is unchanged.
+            mismatch: MismatchSettings::default(),
         }
     }
 }

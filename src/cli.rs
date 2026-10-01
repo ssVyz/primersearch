@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, ValueEnum};
 
 use crate::config::ConfigFile;
-use crate::engine::{base_mask, Orientation, SearchMode, SearchSettings};
+use crate::engine::{base_mask, MismatchOp, Orientation, SearchMode, SearchSettings};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -79,7 +79,9 @@ pub struct Args {
     #[arg(long = "oligo", value_name = "UM")]
     pub oligo_conc: Option<f64>,
 
-    /// Search mode.
+    /// Search mode. `optimize-by-mismatch` searches for the best set of
+    /// --n-oligos oligos (each with --ambiguities codes) under a coverage
+    /// criterion that tolerates mismatches (--mismatch-mode, --mismatches).
     #[arg(long, value_enum)]
     pub mode: Option<CliSearchMode>,
 
@@ -104,6 +106,39 @@ pub struct Args {
     /// Higher = closer to optimal per-round coverage but slower.
     #[arg(long, value_name = "N")]
     pub max_seeds: Option<usize>,
+
+    /// Coverage criterion (optimize-by-mismatch mode). Each sequence is scored
+    /// by its best-matching oligo in the set: `lower-or-equal` counts it when
+    /// that oligo has at most --mismatches mismatches; `exact` counts it only
+    /// when it has exactly --mismatches (better matches do not count).
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub mismatch_mode: Option<CliMismatchMode>,
+
+    /// Number of oligos in the optimized set (optimize-by-mismatch mode).
+    /// Injected oligos count toward it. Default 1.
+    #[arg(long, value_name = "N")]
+    pub n_oligos: Option<usize>,
+
+    /// Number of mismatches of the coverage criterion (optimize-by-mismatch
+    /// mode). Default 0.
+    #[arg(long, value_name = "X")]
+    pub mismatches: Option<usize>,
+
+    /// Ambiguity codes per oligo (optimize-by-mismatch mode): exactly this
+    /// many, or fewer where a region has fewer variable positions. Default 0.
+    #[arg(long, value_name = "Y")]
+    pub ambiguities: Option<usize>,
+
+    /// Abort when more than this many candidate oligos would be enumerated
+    /// (optimize-by-mismatch mode; checked before the search starts;
+    /// 0 = no limit).
+    #[arg(long, value_name = "N")]
+    pub max_candidates: Option<u64>,
+
+    /// Abort when the set search needs more than this many candidate
+    /// evaluations (optimize-by-mismatch mode; 0 = no limit).
+    #[arg(long, value_name = "N")]
+    pub max_work: Option<u64>,
 
     /// Forbid N (4-fold) consensus codes (incremental mode).
     #[arg(long)]
@@ -161,7 +196,8 @@ pub struct Args {
     /// `--exclude ACGT...,TTGC...`). Oligos may contain IUPAC ambiguity codes.
     /// Provide them in the same orientation as the run (so for `--rev`, the
     /// reverse-complement form you would order), matching `--inject`.
-    /// `--inject`ed oligos are exempt. Ignored in `--fixed` mode.
+    /// `--inject`ed oligos are exempt. Ignored in `--fixed` mode, except in
+    /// optimize-by-mismatch mode.
     #[arg(long = "exclude", value_name = "OLIGO", value_delimiter = ',')]
     pub exclude: Vec<String>,
 }
@@ -170,6 +206,13 @@ pub struct Args {
 pub enum CliSearchMode {
     NoAmbiguities,
     Incremental,
+    OptimizeByMismatch,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliMismatchMode {
+    LowerOrEqual,
+    Exact,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -206,9 +249,31 @@ pub fn resolve(args: &Args, cfg: &ConfigFile) -> ResolvedConfig {
         settings.mode = match m {
             CliSearchMode::NoAmbiguities => SearchMode::NoAmbiguities,
             CliSearchMode::Incremental => SearchMode::Incremental,
+            CliSearchMode::OptimizeByMismatch => SearchMode::OptimizeByMismatch,
         };
     }
     settings.fixed = args.fixed;
+    if let Some(m) = args.mismatch_mode {
+        settings.mismatch.op = match m {
+            CliMismatchMode::LowerOrEqual => MismatchOp::LowerOrEqual,
+            CliMismatchMode::Exact => MismatchOp::Exact,
+        };
+    }
+    if let Some(v) = args.n_oligos {
+        settings.mismatch.oligo_count = v;
+    }
+    if let Some(v) = args.mismatches {
+        settings.mismatch.mismatches = v;
+    }
+    if let Some(v) = args.ambiguities {
+        settings.mismatch.ambiguities = v;
+    }
+    if let Some(v) = args.max_candidates {
+        settings.mismatch.max_candidates = v;
+    }
+    if let Some(v) = args.max_work {
+        settings.mismatch.max_work = v;
+    }
     if let Some(v) = args.target {
         settings.target_coverage_pct = v;
     }

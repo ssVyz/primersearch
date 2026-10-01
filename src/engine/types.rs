@@ -5,6 +5,82 @@
 pub enum SearchMode {
     NoAmbiguities,
     Incremental,
+    /// Exhaustive search for the best set of `n` oligos tolerating mismatches.
+    /// Handled by [`crate::engine::find_primers_by_mismatch`], not by the
+    /// greedy round loops; see [`MismatchSettings`].
+    OptimizeByMismatch,
+}
+
+/// Coverage criterion of [`SearchMode::OptimizeByMismatch`]. In both cases a
+/// sequence is scored by its *best-matching* oligo in the set (fewest
+/// mismatches).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MismatchOp {
+    /// A sequence counts when its best match has at most `mismatches`
+    /// mismatches.
+    LowerOrEqual,
+    /// A sequence counts only when its best match has exactly `mismatches`
+    /// mismatches; sequences matched better than that do not count.
+    Exact,
+}
+
+/// Parameters of [`SearchMode::OptimizeByMismatch`]. Ignored by the other
+/// modes.
+#[derive(Debug, Clone)]
+pub struct MismatchSettings {
+    pub op: MismatchOp,
+    /// Number of oligos in the optimised set (`n`). Injected oligos count
+    /// toward it.
+    pub oligo_count: usize,
+    /// Mismatch count `x` of the coverage criterion.
+    pub mismatches: usize,
+    /// Ambiguity codes per candidate oligo (`y`); fewer only where a window
+    /// has fewer eligible variable positions.
+    pub ambiguities: usize,
+    /// Upper bound on the candidate oligos enumerated, checked before any
+    /// work starts. `0` = no limit.
+    pub max_candidates: u64,
+    /// Upper bound on candidate evaluations during the set search. `0` = no
+    /// limit.
+    pub max_work: u64,
+}
+
+impl Default for MismatchSettings {
+    fn default() -> Self {
+        Self {
+            op: MismatchOp::LowerOrEqual,
+            oligo_count: 1,
+            mismatches: 0,
+            ambiguities: 0,
+            max_candidates: DEFAULT_MAX_CANDIDATES,
+            max_work: DEFAULT_MAX_WORK,
+        }
+    }
+}
+
+pub const DEFAULT_MAX_CANDIDATES: u64 = 500_000_000;
+pub const DEFAULT_MAX_WORK: u64 = 2_000_000_000;
+
+/// Set-level summary produced by [`SearchMode::OptimizeByMismatch`]. All
+/// counts are numbers of input sequences.
+#[derive(Debug, Clone, Default)]
+pub struct MismatchReport {
+    /// `level_counts[j]` = sequences whose best-matching oligo in the set has
+    /// exactly `j` mismatches, for `j = 0..=mismatches`.
+    pub level_counts: Vec<usize>,
+    /// Sequences with more than `mismatches` mismatches to every oligo, or a
+    /// mismatch in the protected 3' region.
+    pub not_covered: usize,
+    /// Sequences meeting the coverage criterion (the optimised objective).
+    pub counted: usize,
+    /// Alignment windows searched (1 in fixed-slice mode).
+    pub windows: usize,
+    /// Distinct candidate oligos generated across all windows.
+    pub candidates_generated: u64,
+    /// Candidates left after dropping duplicates and dominated ones.
+    pub candidates_reduced: usize,
+    /// Candidate evaluations spent in the set search.
+    pub evaluations: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +114,8 @@ pub struct SearchSettings {
     /// variants are formed (exact vs. IUPAC consensus), but `tm_threshold`
     /// is not used as a gate — see [`crate::engine::find_primers_fixed`].
     pub fixed: bool,
+    /// Parameters of [`SearchMode::OptimizeByMismatch`].
+    pub mismatch: MismatchSettings,
 }
 
 impl SearchSettings {
@@ -79,6 +157,8 @@ pub struct PrimerSearchResult {
     pub primers: Vec<PrimerCandidate>,
     pub total_sequences: usize,
     pub message: String,
+    /// Only set by [`SearchMode::OptimizeByMismatch`].
+    pub mismatch: Option<MismatchReport>,
 }
 
 #[derive(Debug, Clone, Default)]
