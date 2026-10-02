@@ -54,6 +54,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use rayon::prelude::*;
 
@@ -61,7 +62,8 @@ use crate::engine::iupac::{base_mask, is_ambiguous, mask_to_iupac, reverse_compl
 use crate::engine::search::ExcludeSet;
 use crate::engine::tm::{calculate_tm, determine_oligo_length, TmParams};
 use crate::engine::types::{
-    MismatchOp, MismatchReport, PrimerCandidate, PrimerSearchResult, Progress, SearchSettings,
+    MismatchOp, MismatchReport, PrimerCandidate, PrimerSearchResult, Progress, ProgressEvent,
+    ProgressPhase, SearchSettings,
 };
 
 const BASES: [u8; 4] = *b"ACGT";
@@ -69,9 +71,11 @@ const BASES: [u8; 4] = *b"ACGT";
 /// Lists at least this long are scanned / evaluated in parallel.
 const PAR_MIN_ITEMS: usize = 2048;
 
-/// Progress is reported (and cancellation polled) every this many
-/// evaluations during the set search.
-const REPORT_EVERY: u64 = 1 << 22;
+/// Progress is reported (and cancellation polled) about every this many
+/// milliseconds during the set search, checked whenever a thread flushes its
+/// evaluations. Time-based so the rate holds however expensive an evaluation
+/// is (wide bitsets on many sequences).
+const REPORT_INTERVAL_MS: u64 = 250;
 
 /// Set-search nodes with at least this many children explore them in
 /// parallel.
@@ -135,7 +139,12 @@ pub fn find_primers_by_mismatch(
     let exclude = ExcludeSet::new(excluded);
 
     // 1. Windows.
-    progress.report("Optimize by mismatch: collecting windows", 0.0);
+    progress.report_event(&ProgressEvent::new(
+        ProgressPhase::Windows,
+        "Optimize by mismatch: collecting windows",
+        0.0,
+        &[],
+    ));
     let ranges: Vec<(usize, usize)> = if settings.fixed {
         vec![(0, uni.len)]
     } else {
@@ -172,21 +181,26 @@ pub fn find_primers_by_mismatch(
 
     // 2 + 3. Candidates per window, reduced within the window, then across
     // windows (profiles re-expressed over the full-length sequences).
+    let report_windows = |d: usize| {
+        progress.report_event(&ProgressEvent::new(
+            ProgressPhase::Candidates,
+            &format!(
+                "Optimize by mismatch: generated candidates for {}/{} window(s)",
+                d,
+                windows.len()
+            ),
+            10.0 + 50.0 * d as f64 / windows.len().max(1) as f64,
+            &[("done", d as u64), ("total", windows.len() as u64)],
+        ));
+    };
+    report_windows(0);
     let done = AtomicUsize::new(0);
     let per_window: Vec<Result<WindowOutput, String>> = windows
         .par_iter()
         .enumerate()
         .map(|(wi, w)| {
             let out = gen_cfg.window_candidates(wi as u32, w, progress);
-            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            progress.report(
-                &format!(
-                    "Optimize by mismatch: generated candidates for {}/{} window(s)",
-                    d,
-                    windows.len()
-                ),
-                10.0 + 50.0 * d as f64 / windows.len() as f64,
-            );
+            report_windows(done.fetch_add(1, Ordering::Relaxed) + 1);
             out
         })
         .collect();
@@ -199,7 +213,12 @@ pub fn find_primers_by_mismatch(
         window_cands.push(out.cands);
     }
 
-    progress.report("Optimize by mismatch: reducing the candidate pool", 60.0);
+    progress.report_event(&ProgressEvent::new(
+        ProgressPhase::Reduce,
+        "Optimize by mismatch: reducing the candidate pool",
+        60.0,
+        &[("generated", generated)],
+    ));
     let mut pool: Vec<Cand> = if window_cands.len() == 1 {
         // A single window's survivors are already mutually non-dominated.
         let cands = window_cands.pop().expect("one window");
@@ -209,10 +228,20 @@ pub fn find_primers_by_mismatch(
             .collect::<Result<_, _>>()?
     } else {
         let mut sky = Skyline::new(obj, uni.words);
+        let nw = window_cands.len();
         for (wi, cands) in window_cands.into_iter().enumerate() {
             if progress.cancelled() {
                 return Err("search cancelled".to_string());
             }
+            progress.report_event(&ProgressEvent::new(
+                ProgressPhase::Reduce,
+                &format!(
+                    "Optimize by mismatch: reducing the candidate pool ({}/{} window(s))",
+                    wi, nw
+                ),
+                60.0 + 5.0 * wi as f64 / nw as f64,
+                &[("generated", generated), ("done", wi as u64), ("total", nw as u64)],
+            ));
             let expanded: Vec<Cand> = cands
                 .into_par_iter()
                 .map(|c| expand(c, &windows[wi], &uni, obj.planes))
@@ -234,7 +263,13 @@ pub fn find_primers_by_mismatch(
     let n3 = three_prime;
     let mut members: Vec<Member> = Vec::new();
     let mut state = try_zeroed(obj.planes * uni.words, "allocating the search state")?;
-    for oligo in injected {
+    for (i, oligo) in injected.iter().enumerate() {
+        progress.report_event(&ProgressEvent::new(
+            ProgressPhase::Inject,
+            &format!("Injecting oligo {}/{}", i + 1, injected.len()),
+            60.0,
+            &[("done", i as u64), ("total", injected.len() as u64)],
+        ));
         let forward = if is_reverse {
             reverse_complement(oligo)
         } else {
@@ -284,13 +319,19 @@ pub fn find_primers_by_mismatch(
     // 4. Set search.
     let slots = n - members.len();
     if slots > 0 && !pool.is_empty() {
-        progress.report(
+        progress.report_event(&ProgressEvent::new(
+            ProgressPhase::SetSearch,
             &format!(
                 "Optimize by mismatch: searching sets over {} candidates",
                 pool.len()
             ),
             65.0,
-        );
+            &[
+                ("candidates", pool.len() as u64),
+                ("evaluations", 0),
+                ("max_work", ms.max_work),
+            ],
+        ));
     }
     let limits = SearchLimits {
         max_work: ms.max_work,
@@ -1568,7 +1609,8 @@ fn search_sets(
         }),
         version: AtomicU64::new(0),
         evals: AtomicU64::new(0),
-        next_report: AtomicU64::new(REPORT_EVERY),
+        started: Instant::now(),
+        next_report: AtomicU64::new(REPORT_INTERVAL_MS),
         failed: AtomicBool::new(false),
         error: Mutex::new(None),
         limits,
@@ -1631,6 +1673,8 @@ struct Shared<'a> {
     version: AtomicU64,
     /// Evaluations flushed by the workers.
     evals: AtomicU64,
+    started: Instant,
+    /// Milliseconds after `started` at which the next progress report is due.
     next_report: AtomicU64,
     /// Set when a worker hits a limit or cancellation; `error` holds the
     /// first such message.
@@ -1800,23 +1844,30 @@ impl Worker<'_> {
             )));
         }
         let due = sh.next_report.load(Ordering::Relaxed);
-        if total >= due
+        let now = sh.started.elapsed().as_millis() as u64;
+        if now >= due
             && sh
                 .next_report
-                .compare_exchange(due, total + REPORT_EVERY, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(due, now + REPORT_INTERVAL_MS, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
             if sh.progress.cancelled() {
                 return Err(sh.fail("search cancelled".to_string()));
             }
-            sh.progress.report(
+            sh.progress.report_event(&ProgressEvent::new(
+                ProgressPhase::SetSearch,
                 &format!(
                     "Optimize by mismatch: searching sets over {} candidates ({} evaluations)",
                     sh.pool.len(),
                     total
                 ),
                 70.0,
-            );
+                &[
+                    ("candidates", sh.pool.len() as u64),
+                    ("evaluations", total),
+                    ("max_work", limits.max_work),
+                ],
+            ));
         }
         Ok(())
     }

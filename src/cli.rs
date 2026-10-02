@@ -34,6 +34,13 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "text")]
     pub format: CliOutputFormat,
 
+    /// Progress reporting on stderr. `spinner` (default) draws a spinner when
+    /// stderr is a terminal. `jsonl` writes one JSON object per line instead,
+    /// throttled, for programmatic consumers; it is not suppressed by
+    /// `--silent`, and a failed run ends with a `{"type":"error",…}` line.
+    #[arg(long, value_enum, value_name = "MODE", default_value = "spinner")]
+    pub progress: CliProgressMode,
+
     /// Path to settings.ini (default: next to the executable).
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -219,6 +226,12 @@ pub enum CliMismatchMode {
 pub enum CliOutputFormat {
     Text,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliProgressMode {
+    Spinner,
+    Jsonl,
 }
 
 pub struct ResolvedConfig {

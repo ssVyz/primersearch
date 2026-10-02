@@ -11,7 +11,7 @@ use std::path::Path;
 
 use clap::Parser;
 
-use crate::cli::{Args, CliOutputFormat};
+use crate::cli::{Args, CliOutputFormat, CliProgressMode};
 use crate::engine::{
     find_primers, find_primers_by_mismatch, find_primers_fixed, parse_fasta, quality_filter,
     PrimerSearchResult, QualityReport, SearchMode, SearchSettings,
@@ -20,8 +20,12 @@ use crate::progress::CliProgress;
 
 fn main() {
     let args = Args::parse();
+    let jsonl = args.progress == CliProgressMode::Jsonl;
     if let Err(e) = run(args) {
         eprintln!("error: {e}");
+        if jsonl {
+            progress::emit_error(&e.to_string());
+        }
         std::process::exit(1);
     }
 }
@@ -138,7 +142,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("primersearch: excluding {} 3' signature(s)", excluded.len());
     }
 
-    let progress = CliProgress::new(args.silent);
+    let progress = CliProgress::new(args.progress, args.silent);
     let result = if by_mismatch {
         find_primers_by_mismatch(&report.valid_sequences, &settings, &injected, &excluded, &progress)
     } else if settings.fixed {

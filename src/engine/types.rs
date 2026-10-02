@@ -174,10 +174,77 @@ pub struct QualityReport {
     pub valid_sequences: Vec<Vec<u8>>,
 }
 
+/// Stage of a run, carried by [`ProgressEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressPhase {
+    /// Placing injected oligos (any mode).
+    Inject,
+    /// A greedy search round: collecting and evaluating ranges, round done.
+    Round,
+    /// Fixed-slice variant generation (greedy modes).
+    Fixed,
+    /// Optimize-by-mismatch: collecting windows.
+    Windows,
+    /// Optimize-by-mismatch: per-window candidate generation.
+    Candidates,
+    /// Optimize-by-mismatch: reducing the candidate pool.
+    Reduce,
+    /// Optimize-by-mismatch: branch-and-bound set search.
+    SetSearch,
+}
+
+impl ProgressPhase {
+    /// Short machine-readable name, e.g. `"set_search"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProgressPhase::Inject => "inject",
+            ProgressPhase::Round => "round",
+            ProgressPhase::Fixed => "fixed",
+            ProgressPhase::Windows => "windows",
+            ProgressPhase::Candidates => "candidates",
+            ProgressPhase::Reduce => "reduce",
+            ProgressPhase::SetSearch => "set_search",
+        }
+    }
+}
+
+/// A structured progress report: the message and percentage of
+/// [`Progress::report`] plus the phase and the counters known at that point,
+/// as `(name, value)` pairs (e.g. `[("done", 12), ("total", 40)]`).
+#[derive(Debug, Clone, Copy)]
+pub struct ProgressEvent<'a> {
+    pub message: &'a str,
+    pub pct: f64,
+    pub phase: Option<ProgressPhase>,
+    pub counters: &'a [(&'static str, u64)],
+}
+
+impl<'a> ProgressEvent<'a> {
+    pub fn new(
+        phase: ProgressPhase,
+        message: &'a str,
+        pct: f64,
+        counters: &'a [(&'static str, u64)],
+    ) -> Self {
+        Self {
+            message,
+            pct,
+            phase: Some(phase),
+            counters,
+        }
+    }
+}
+
 /// Progress sink. Implementors must be `Sync + Send` so the engine can call
 /// `report` from any worker thread.
 pub trait Progress: Sync + Send {
     fn report(&self, message: &str, pct: f64);
+    /// Structured form of [`report`](Self::report), used by the engine for
+    /// every report. The default forwards the message and percentage, so a
+    /// sink that only shows text implements `report` alone.
+    fn report_event(&self, event: &ProgressEvent<'_>) {
+        self.report(event.message, event.pct);
+    }
     fn cancelled(&self) -> bool {
         false
     }

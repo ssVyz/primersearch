@@ -26,8 +26,8 @@ use rayon::prelude::*;
 use crate::engine::iupac::{base_mask, complement_mask, is_ambiguous, mask_to_iupac, reverse_complement};
 use crate::engine::tm::{calculate_tm, determine_oligo_length, TmParams};
 use crate::engine::types::{
-    MismatchSettings, Orientation, PrimerCandidate, PrimerSearchResult, Progress, SearchMode,
-    SearchSettings,
+    MismatchSettings, Orientation, PrimerCandidate, PrimerSearchResult, Progress, ProgressEvent,
+    ProgressPhase, SearchMode, SearchSettings,
 };
 
 // ---------------------------------------------------------------------------
@@ -87,14 +87,17 @@ pub fn find_primers(
             .map(|&i| sequences[i].as_slice())
             .collect();
 
-        progress.report(
+        let covered = (total - remaining_list.len()) as u64;
+        progress.report_event(&ProgressEvent::new(
+            ProgressPhase::Round,
             &format!(
                 "Round {}: collecting candidate ranges ({} sequences remaining)",
                 round,
                 remaining_list.len()
             ),
             0.0,
-        );
+            &[("round", round), ("covered", covered), ("total", total as u64)],
+        ));
 
         // Phase 1: collect unique alignment ranges (start, end). Each range
         // came from at least one remaining sequence whose slice reaches the
@@ -122,10 +125,17 @@ pub fn find_primers(
             break;
         }
 
-        progress.report(
+        progress.report_event(&ProgressEvent::new(
+            ProgressPhase::Round,
             &format!("Round {}: evaluating {} unique ranges", round, ranges.len()),
             10.0,
-        );
+            &[
+                ("round", round),
+                ("covered", covered),
+                ("total", total as u64),
+                ("ranges", ranges.len() as u64),
+            ],
+        ));
 
         // Phase 2: evaluate ranges in parallel, collect candidates.
         let candidates: Vec<EvalResult> = ranges
@@ -180,7 +190,8 @@ pub fn find_primers(
         }
         result.primers.push(primer);
         let covered_so_far = total - remaining.len();
-        progress.report(
+        progress.report_event(&ProgressEvent::new(
+            ProgressPhase::Round,
             &format!(
                 "Round {} done: primer covers {} sequences ({:.1}%). Total: {}/{} ({:.1}%)",
                 round,
@@ -191,7 +202,8 @@ pub fn find_primers(
                 covered_so_far as f64 / total as f64 * 100.0
             ),
             100.0,
-        );
+            &[("round", round), ("covered", covered_so_far as u64), ("total", total as u64)],
+        ));
     }
 
     result
@@ -281,14 +293,20 @@ pub fn find_primers_fixed(
             .map(|&i| sequences[i].as_slice())
             .collect();
 
-        progress.report(
+        progress.report_event(&ProgressEvent::new(
+            ProgressPhase::Fixed,
             &format!(
                 "Fixed slice: generating variant {} ({} sequences uncovered)",
                 round,
                 remaining_list.len()
             ),
             0.0,
-        );
+            &[
+                ("round", round),
+                ("covered", (total - remaining_list.len()) as u64),
+                ("total", total as u64),
+            ],
+        ));
 
         // One range, evaluated directly — no phase-1 discovery, no rayon.
         let Some(best) = evaluate_range(
@@ -320,7 +338,8 @@ pub fn find_primers_fixed(
         result.primers.push(primer);
 
         let covered_so_far = total - remaining.len();
-        progress.report(
+        progress.report_event(&ProgressEvent::new(
+            ProgressPhase::Fixed,
             &format!(
                 "Fixed slice: variant {} covers {} sequences ({:.1}%). Total: {}/{} ({:.1}%)",
                 round,
@@ -331,7 +350,8 @@ pub fn find_primers_fixed(
                 covered_so_far as f64 / total as f64 * 100.0
             ),
             100.0,
-        );
+            &[("round", round), ("covered", covered_so_far as u64), ("total", total as u64)],
+        ));
     }
 
     result
@@ -413,10 +433,12 @@ fn apply_injected_oligos(
             continue;
         }
 
-        progress.report(
+        progress.report_event(&ProgressEvent::new(
+            ProgressPhase::Inject,
             &format!("Injecting oligo {}/{}", i + 1, injected.len()),
             0.0,
-        );
+            &[("done", i as u64), ("total", injected.len() as u64)],
+        ));
 
         // 1. Intrinsic position: the start covering the most input sequences.
         let mut best_start = 0usize;

@@ -23,6 +23,6 @@ pub use search::{find_primers, find_primers_fixed};
 pub use tm::{calculate_tm, determine_oligo_length, TmParams};
 pub use types::{
     MismatchOp, MismatchReport, MismatchSettings, NoProgress, Orientation, PrimerCandidate,
-    PrimerSearchResult, Progress, QualityReport, SearchMode, SearchSettings,
-    DEFAULT_MAX_CANDIDATES, DEFAULT_MAX_WORK,
+    PrimerSearchResult, Progress, ProgressEvent, ProgressPhase, QualityReport, SearchMode,
+    SearchSettings, DEFAULT_MAX_CANDIDATES, DEFAULT_MAX_WORK,
 };

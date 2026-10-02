@@ -290,6 +290,7 @@ defaults file, or pass `--config <path>` to point at an alternative.
 |------|---------|
 | `-o, --output FILE` | Output destination. Text mode defaults to `output.txt`; JSON mode defaults to stdout. `-o -` forces stdout in either mode |
 | `--format {text,json}` | Output format (default `text`). `json` emits a structured document for programmatic consumers; see "Programmatic / subprocess use" |
+| `--progress {spinner,jsonl}` | Progress on stderr (default `spinner`). `jsonl` writes throttled JSON lines instead, even with `--silent`; see "Progress output" |
 | `--no-config` | Ignore the settings file entirely: built-in defaults overlaid by CLI flags only, no `settings.ini` read or created |
 | `--rev` / `--fwd` | Search reverse / forward orientation |
 | `--tm C` | Minimum Tm in °C |
@@ -312,7 +313,7 @@ defaults file, or pass `--config <path>` to point at an alternative.
 | `--mismatch-mode {lower-or-equal,exact}` | Count sequences matched with at most / exactly `X` mismatches (optimize-by-mismatch) |
 | `--max-candidates N` / `--max-work N` | Search-space limits of optimize-by-mismatch (0 = no limit) |
 | `-j, --threads N` | Worker threads (0 = all logical cores) |
-| `-s, --silent` | Suppress progress / info |
+| `-s, --silent` | Suppress the spinner and info lines (not `--progress jsonl` lines) |
 | `--mkini` | Write a default `settings.ini` and exit |
 
 `primersearch --help` for the full list.
@@ -331,7 +332,8 @@ The output file contains:
 
 The same preprocessing report is also written to stdout during the run
 so you can abort early if the input data looks bad. Progress messages
-go to stderr (and are suppressed by `--silent`).
+go to stderr (and are suppressed by `--silent`, unless
+`--progress jsonl` is used).
 
 ## Programmatic / subprocess use
 
@@ -355,6 +357,8 @@ primersearch input.fasta --format json --no-config --silent [other flags...]
   informational lines on stderr. Errors are *not* suppressed: any failure
   still prints `error: …` to stderr and exits non-zero (exit code `1`;
   argument-parsing errors exit `2`).
+- `--progress jsonl` (optional) adds a machine-readable progress stream on
+  stderr; see "Progress output" below.
 
 The JSON document (`format_version: 1`) has three top-level objects:
 
@@ -383,6 +387,60 @@ keys are absent in the other modes, whose documents are unchanged.
 
 Bump-guard on `format_version` before parsing; it increments only on a
 backward-incompatible shape change.
+
+### Progress output (`--progress jsonl`)
+
+`--progress jsonl` replaces the spinner with one compact JSON object per
+line on **stderr**. stdout and the result document are unchanged.
+`--silent` does not suppress these lines (it still suppresses the
+`primersearch: …` lines), so a front-end passes both:
+
+```
+primersearch input.fasta --format json --no-config --silent --progress jsonl [other flags...]
+```
+
+Every line has a `type`. `progress` lines carry `message` (the spinner
+text), `pct` (a coarse 0–100 estimate), `phase` and the counters known in
+that phase; keys that do not apply are omitted:
+
+```json
+{"type":"progress","message":"Optimize by mismatch: generated candidates for 1234/5541 window(s)","pct":32.3,"phase":"candidates","done":1234,"total":5541}
+{"type":"progress","message":"Optimize by mismatch: searching sets over 17 candidates (12582912 evaluations)","pct":70.0,"phase":"set_search","candidates":17,"evaluations":12582912,"max_work":2000000000}
+```
+
+| phase | stage | counters |
+|---|---|---|
+| `inject` | placing injected oligos (any mode) | `done`, `total` (oligos) |
+| `round` | greedy round: collecting ranges, evaluating them, round done | `round`, `covered`, `total` (sequences); `ranges` while evaluating |
+| `fixed` | fixed-slice variant generation (greedy modes) | `round`, `covered`, `total` |
+| `windows` | optimize-by-mismatch: collecting windows | — |
+| `candidates` | optimize-by-mismatch: candidate generation | `done`, `total` (windows) |
+| `reduce` | optimize-by-mismatch: reducing the pool | `generated` (candidates enumerated); `done`, `total` (windows) when there are several |
+| `set_search` | optimize-by-mismatch: set search | `candidates` (pool after reduction), `evaluations` so far, `max_work` (0 = no limit) |
+
+`done` counts finished items. `pct` stays coarse (65–70 throughout the set
+search, whose total work cannot be predicted); `evaluations / max_work`
+shows how close the run is to the work limit. A `--fixed`
+optimize-by-mismatch run has a single window, so `candidates` goes from
+`0/1` to `1/1` with nothing in between.
+
+Lines never interleave and are flushed immediately. A line is written at
+once when the phase changes, otherwise at most one per 200 ms; a line held
+back is written when its 200 ms are up or the run ends, so the latest state
+is at most about 250 ms old. The set search reports about every 250 ms.
+
+A failed run (any `error: …` exit, including the `--max-work`,
+`--max-candidates` and memory limits and parameter validation) ends stderr
+with an `error` line after the plain `error: …` line; the exit code stays
+`1`:
+
+```json
+{"type":"error","message":"the set search exceeded the work limit of …"}
+```
+
+Argument-parsing errors (exit `2`) are plain text only. Without `--silent`
+the `primersearch: …` lines appear as plain text between the JSON lines;
+treat any line that does not parse as JSON as plain text.
 
 ## How it works
 
@@ -467,18 +525,20 @@ src/
   cli.rs           clap-based argument definitions
   config.rs        settings.ini load / write (TOML syntax)
   output.rs        text rendering of the preprocessing + results blocks
-  progress.rs      indicatif-based progress sink
+  progress.rs      progress sinks: indicatif spinner, JSON lines
   engine/          self-contained analysis logic — depends only on std
                    and rayon, no CLI / serde / I/O. Drop the directory
                    into another project to reuse:
     mod.rs           module re-exports + the public API surface
     types.rs         SearchSettings / PrimerCandidate / etc., Progress trait
+                     and ProgressEvent
     iupac.rs         bitmask-based IUPAC code utilities
     fasta.rs         FASTA parser + quality filter
     tm.rs            nearest-neighbor thermodynamic Tm
     search.rs        greedy round loop, per-range evaluators
     mismatch.rs      optimize-by-mismatch: candidate enumeration,
                      dominance reduction, branch-and-bound set search
+tests/             end-to-end CLI tests (progress_cli.rs: --progress jsonl)
 example_sets/      reference inputs and Python-tool outputs for testing
 reference_program/ original Python implementation (kept for reference)
 program_instructions.md  initial spec / Q&A
